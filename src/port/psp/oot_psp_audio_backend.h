@@ -18,7 +18,7 @@ typedef enum OotPspAudioProducerState {
     OOT_PSP_AUDIO_PRODUCER_STATE_RING_FULL,
     OOT_PSP_AUDIO_PRODUCER_STATE_WAIT_ME,
     OOT_PSP_AUDIO_PRODUCER_STATE_PREPARE,
-    OOT_PSP_AUDIO_PRODUCER_STATE_SYNTH,
+    OOT_PSP_AUDIO_PRODUCER_STATE_SEQUENCE,
     OOT_PSP_AUDIO_PRODUCER_STATE_SUBMIT,
 } OotPspAudioProducerState;
 
@@ -65,6 +65,7 @@ void OotPspAudioBackend_SetDiagnosticProducerState(OotPspAudioProducerState stat
 #endif
 void OotPspAudioBackend_SubmitCommands(const Acmd* cmdList, s32 cmdCount);
 void OotPspAudioBackend_SubmitCommandsAndQueue(const Acmd* cmdList, s32 cmdCount, const void* buf, u32 size);
+void OotPspAudioBackend_SubmitSynthesis(Acmd* cmdList, s16* aiBuffer, s32 aiFrames);
 void OotPspAudioBackend_WaitForCommands(void);
 void OotPspAudioBackend_ExecuteCommands(const Acmd* cmdList, s32 cmdCount);
 

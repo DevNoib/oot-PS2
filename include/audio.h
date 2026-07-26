@@ -1058,6 +1058,13 @@ typedef struct AudioHeapInitSizes {
 // TODO these prototypes should be sorted into the relevant audio header files
 
 Acmd* AudioSynth_Update(Acmd* cmdStart, s32* cmdCnt, s16* aiStart, s32 aiBufLen);
+void AudioSynth_ProcessSequenceControl(void);
+Acmd* AudioSynth_BuildCommandList(Acmd* cmdStart, s32* cmdCnt, s16* aiStart, s32 aiBufLen);
+#if defined(TARGET_PSP)
+Acmd* AudioSynth_BuildCommandListMe(Acmd* cmdStart, s32* cmdCnt, s16* aiStart, s32 aiBufLen);
+s32 AudioSynth_CanBuildCommandsOnMe(void);
+void OotPspAudioSynth_InvalidateMeState(void);
+#endif
 void AudioHeap_DiscardFont(s32 fontId);
 void AudioHeap_ReleaseNotesForFont(s32 fontId);
 void AudioHeap_DiscardSequence(s32 seqId);

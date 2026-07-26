@@ -25,7 +25,7 @@ once per second, and never calls `printf` from `OOT PSP AudioOut` or `OOT PSP Au
 
 The first snapshot line reports live execution state:
 
-- `prod`: logical `AudioGen` phase. Important values are `WAIT_ME`, `PREPARE`, `SYNTH`, `SUBMIT`, `TIMER`,
+- `prod`: logical `AudioGen` phase. Important values are `WAIT_ME`, `PREPARE`, `SEQUENCE`, `SUBMIT`, `TIMER`,
   `IO_BACKOFF`, and `RING_FULL`.
 - `out`: logical `AudioOut` phase. `WAIT_HW` is normally healthy: `sceAudio*OutputBlocking` is holding the output
   thread until the hardware needs its next buffer. `PRIME` means it is intentionally submitting silence while
@@ -38,17 +38,20 @@ The first snapshot line reports live execution state:
 - `wait`, `waiter`, and `age`: whether an Allegrex thread is currently blocked waiting for the ME, that thread's
   ID, and the current wait duration.
 
-ME progress checkpoints during `me=RUN` are:
+The normal combined job is reported as `me=SYNTH`. Its progress checkpoints are:
 
 | Progress | ME work |
 | --- | --- |
-| `1` | Invalidating command and sample inputs |
-| `2` | Executing the audio mixer command list |
-| `3` | Copying generated PCM into the output ring |
-| `4` | Writing mixer state back for Allegrex |
+| `1` | Entering the combined job and refreshing Allegrex-owned inputs |
+| `2` | Constructing the ABI command list |
+| `3` | Publishing the completed list and synthesis state |
+| `4` | Executing the audio mixer command list |
+| `5` | Copying generated PCM into the output ring |
+| `6` | Writing mixer state back for Allegrex |
 
-`me=IDLE` with progress `4` is normal after a completed job. Progress `256` (`0x100`) means ME boot and VME setup
-completed but no job checkpoint has replaced it yet.
+The older command-only path is reported as `me=RUN`; it skips progress `2` and `3`. `me=IDLE` with progress `6`
+is normal after a completed audio-generation job. Progress `256` (`0x100`) means ME boot and VME setup completed
+but no job checkpoint has replaced it yet.
 
 The second line reports buffer pressure and one-second event counts. `buf=current/target` includes ring data, an
 outstanding ME queue, and frames owned by the audio driver. `ring`, `meq`, and `driver` show those pieces
@@ -61,12 +64,16 @@ The third line breaks a completed audio update into average microseconds:
 
 - `wait_me`: Allegrex synchronization with the previous ME job.
 - `prepare`: command handling, audio loads, DMA completion, and buffer preparation.
-- `synth`: sequence processing plus construction of the mixer command list.
-- `seq` and `cmd`: the two measured components of `synth`.
+- `synth` and `seq`: Allegrex sequence/control processing. Command construction is no longer included in normal
+  Allegrex phase timing.
+- `cmd`: Allegrex command construction time in the CPU fallback path; it should be zero while the ME is active.
 - `submit`: cache publication and submission of the new ME job.
 - `abi` and `dma`: average mixer command and sample-DMA counts per update.
 
-Two additional lines profile work inside ME progress `2`:
+An update that needs a nonresident sample DMA is intentionally preflighted onto Allegrex so the ME never enters
+an I/O path. Such an update increments the CPU-mix count and can produce a nonzero `cmd` without disabling the ME.
+
+Two additional lines profile mixer work inside ME progress `4`:
 
 - `me-job` reports completed ME mixer jobs, command count, average and last job cost, and the most expensive
   opcode in the last and worst jobs. `max_all` is the worst profiled job since boot.
@@ -83,7 +90,7 @@ example:
 [audio] me-op 1s total=27710102tick top=ENVMIXER 61.8% n=1830 avg=9360 max_all=28120 | RESAMPLE 20.4% n=1220 avg=4635 max_all=12004 | ADPCM 9.7% n=610 avg=4407 max_all=9871
 ```
 
-The live state and urgent event lines also include `op=NAME#index`. While `me=RUN/2`, this is the command the ME
+The live state and urgent event lines also include `op=NAME#index`. While `me=SYNTH/4` or `me=RUN/4`, this is the command the ME
 is executing at the instant the diagnostic thread samples it. `op=IDLE` means the most recent command list has
 finished. `snapshot=BUSY` only means the ME was publishing a completed profile at that instant; the logger retries
 on the next report.
@@ -91,13 +98,13 @@ on the next report.
 ## Reading a stutter
 
 - An `[audio!] UNDERRUN` with `buf` near zero confirms starvation rather than a bad sample or mixer artifact.
-- High `wait_me`, live `wait=1`, and `me=RUN/2` point to ME mixer execution as the bottleneck. Progress `1`, `3`,
-  or `4` instead isolates cache input, PCM queueing, or state writeback.
-- When `me=RUN/2` is slow, use `me-op` total percentage to choose the first function to optimize. Use `avg` to
+- High `wait_me`, live `wait=1`, and `me=SYNTH/4` point to ME mixer execution as the bottleneck. Progress `2`, `5`,
+  or `6` instead isolates command construction, PCM queueing, or state writeback.
+- When `me=SYNTH/4` is slow, use `me-op` total percentage to choose the first function to optimize. Use `avg` to
   distinguish an intrinsically expensive command from one that dominates only because it is called often, and
   compare `last_hot`/`max_hot` against slow-job or underrun periods.
-- High `synth`, with low `wait_me`, points to Allegrex-side sequence or command construction. Compare `seq` and
-  `cmd`.
+- High `synth`, with low `wait_me`, points to Allegrex-side sequence/control work. A nonzero `cmd` indicates that
+  the backend fell back to Allegrex command construction.
 - High `prepare`, a waiting producer kernel state, and elevated `dma` point to sample loading or DMA completion.
 - Rising `io` means foreground asset reads are causing the producer's intentional I/O backoff.
 - Rising `late`/`maxlate_all` and `catchup` with low phase times point to scheduling starvation elsewhere in the

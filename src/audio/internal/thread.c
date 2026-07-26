@@ -45,7 +45,9 @@ static AudioTask* sWaitingAudioTask = NULL;
  */
 AudioTask* AudioThread_UpdateImpl(void) {
 #if OOT_VERSION < PAL_1_0 || !PLATFORM_N64
+#if !defined(TARGET_PSP)
     static s32 sMaxAbiCmdCnt = 0x80;
+#endif
     static AudioTask* sWaitingAudioTask = NULL;
 #endif
     u32 samplesRemainingInAi;
@@ -193,24 +195,28 @@ AudioTask* AudioThread_UpdateImpl(void) {
     profileBeforeSynthUsec = sceKernelGetSystemTimeLow();
 #endif
 #if defined(TARGET_PSP)
-    OotPspAudioBackend_SetDiagnosticProducerState(OOT_PSP_AUDIO_PRODUCER_STATE_SYNTH);
-#endif
+    OotPspAudioBackend_SetDiagnosticProducerState(OOT_PSP_AUDIO_PRODUCER_STATE_SEQUENCE);
+    AudioSynth_ProcessSequenceControl();
+    abiCmdCnt = 0;
+#else
     gAudioCtx.curAbiCmdBuf =
         AudioSynth_Update(gAudioCtx.curAbiCmdBuf, &abiCmdCnt, curAiBuffer, gAudioCtx.aiBufLengths[index]);
+#endif
 #if defined(TARGET_PSP) && (defined(OOTDEBUG) || OOT_PSP_AUDIO_DIAGNOSTICS)
     profileAfterSynthUsec = sceKernelGetSystemTimeLow();
+    OotPspAudioBackend_RecordSynthesisProfile(profileAfterSynthUsec - profileBeforeSynthUsec, 0);
 #endif
 #if defined(TARGET_PSP)
     OotPspAudioBackend_SetDiagnosticProducerState(OOT_PSP_AUDIO_PRODUCER_STATE_SUBMIT);
-    OotPspAudioBackend_SubmitCommandsAndQueue(gAudioCtx.abiCmdBufs[gAudioCtx.rspTaskIndex], abiCmdCnt,
-                                              curAiBuffer, gAudioCtx.aiBufLengths[index] * 4);
+    OotPspAudioBackend_SubmitSynthesis(gAudioCtx.abiCmdBufs[gAudioCtx.rspTaskIndex], curAiBuffer,
+                                      gAudioCtx.aiBufLengths[index]);
 #endif
 #if defined(TARGET_PSP) && (defined(OOTDEBUG) || OOT_PSP_AUDIO_DIAGNOSTICS)
     profileEndUsec = sceKernelGetSystemTimeLow();
     OotPspAudioBackend_RecordUpdateProfile(
         profileAfterWaitUsec - profileStartUsec, profileBeforeSynthUsec - profileAfterWaitUsec,
         profileAfterSynthUsec - profileBeforeSynthUsec, profileEndUsec - profileAfterSynthUsec,
-        (u32)abiCmdCnt, (u32)gAudioCtx.curAudioFrameDmaCount);
+        0, (u32)gAudioCtx.curAudioFrameDmaCount);
 #endif
 
     // Update audioRandom to the next random number
@@ -256,13 +262,21 @@ AudioTask* AudioThread_UpdateImpl(void) {
     task->output_buff_size = NULL;
     if (1) {}
     task->data_ptr = (u64*)gAudioCtx.abiCmdBufs[index];
+#if defined(TARGET_PSP)
+    /* The ME is still constructing this list when the PSP audio update
+     * returns; PSP never submits this legacy RSP task. */
+    task->data_size = 0;
+#else
     task->data_size = abiCmdCnt * sizeof(Acmd);
+#endif
     task->yield_data_ptr = NULL;
     task->yield_data_size = 0;
 
+#if !defined(TARGET_PSP)
     if (sMaxAbiCmdCnt < abiCmdCnt) {
         sMaxAbiCmdCnt = abiCmdCnt;
     }
+#endif
 
     if (gAudioCtx.audioBufferParameters.specUnk4 == 1) {
         return gAudioCtx.curTask;

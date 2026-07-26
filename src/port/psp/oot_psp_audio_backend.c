@@ -86,6 +86,7 @@ typedef enum {
     OOT_PSP_AUDIO_ME_STATE_BOOTING,
     OOT_PSP_AUDIO_ME_STATE_IDLE,
     OOT_PSP_AUDIO_ME_STATE_RUN,
+    OOT_PSP_AUDIO_ME_STATE_SYNTH_RUN,
     OOT_PSP_AUDIO_ME_STATE_QUEUE_BUFFER,
     OOT_PSP_AUDIO_ME_STATE_STOP,
     OOT_PSP_AUDIO_ME_STATE_HALTED,
@@ -210,6 +211,7 @@ static volatile u32 sAudioProfileMeFailures;
 
 static const Acmd* sAudioMePendingCmdList;
 static s32 sAudioMePendingCmdCount;
+static s32 sAudioMePendingSynthesis;
 static u32 sAudioMePendingStartTime;
 static const s16* sAudioMePendingQueueSrc;
 static u32 sAudioMePendingQueueFrames;
@@ -250,6 +252,11 @@ static void OotPspAudioBackend_MeWritebackOutputs(const Acmd* cmdList, s32 cmdCo
 static void OotPspAudioBackend_MeQueueBuffer(s32 invalidateSource);
 static void OotPspAudioBackend_QueueCpuCopy(const s16* samples, u32 frames, u32 writePos);
 static u32 OotPspAudioBackend_FreeFrames(void);
+
+static s32 OotPspAudioBackend_MeJobIsRunning(void) {
+    return (sAudioMeState == OOT_PSP_AUDIO_ME_STATE_RUN) ||
+           (sAudioMeState == OOT_PSP_AUDIO_ME_STATE_SYNTH_RUN);
+}
 
 #if OOT_PSP_AUDIO_DIAGNOSTICS
 #define AUDIO_DIAG_SET(variable, value) ((variable) = (value))
@@ -298,25 +305,45 @@ __attribute__((noinline, aligned(4))) void meLibOnProcess(void) {
     meLibSync();
 
     while (sAudioMeState != OOT_PSP_AUDIO_ME_STATE_STOP) {
-        if (sAudioMeState == OOT_PSP_AUDIO_ME_STATE_RUN) {
-            const Acmd* cmdList = (const Acmd*)(uintptr_t)sAudioMeCmdList;
+        if ((sAudioMeState == OOT_PSP_AUDIO_ME_STATE_RUN) ||
+            (sAudioMeState == OOT_PSP_AUDIO_ME_STATE_SYNTH_RUN)) {
+            Acmd* cmdList = (Acmd*)(uintptr_t)sAudioMeCmdList;
             s32 cmdCount = (s32)sAudioMeCmdCount;
             const void* privateOutput = (const void*)(uintptr_t)sAudioMeQueueSrc;
             u32 privateOutputBytes = sAudioMeQueueFrames * OOT_PSP_AUDIO_CHANNELS * sizeof(s16);
 
             sAudioMeProgress = 1;
+            if (sAudioMeState == OOT_PSP_AUDIO_ME_STATE_SYNTH_RUN) {
+                /* Command construction follows Allegrex sequence/control
+                 * preparation. Start from fresh shared state, then publish a
+                 * complete list before the mixer is allowed to consume it. */
+                meLibDcacheWritebackInvalidateAll();
+                sAudioMeProgress = 2;
+                AudioSynth_BuildCommandListMe(cmdList, &cmdCount, (s16*)privateOutput,
+                                              sAudioMeQueueFrames);
+                meLibDcacheWritebackInvalidateAll();
+                meLibSync();
+                sAudioMeCmdCount = (u32)cmdCount;
+                meLibSync();
+                sAudioMeProgress = 3;
+            }
             OotPspAudioBackend_MeInvalidateInputs(cmdList, cmdCount, privateOutput, privateOutputBytes);
-            sAudioMeProgress = 2;
+            sAudioMeProgress = 4;
             OotPspMixer_ExecuteCommandListMe(cmdList, cmdCount, OOT_PSP_AUDIO_ME_OPCODE_PROFILE);
             if (sAudioMeQueueFrames != 0) {
-                sAudioMeProgress = 3;
+                sAudioMeProgress = 5;
                 /* A_SAVEBUFF just produced this PCM in the ME cache. Copy it
                  * into the ring before writeback instead of flushing and
                  * immediately reloading the same samples. */
                 OotPspAudioBackend_MeQueueBuffer(false);
             }
-            sAudioMeProgress = 4;
+            sAudioMeProgress = 6;
             OotPspAudioBackend_MeWritebackOutputs(cmdList, cmdCount, privateOutput, privateOutputBytes);
+            if (sAudioMeState == OOT_PSP_AUDIO_ME_STATE_SYNTH_RUN) {
+                /* Leave no dirty ME cache lines behind for Allegrex to
+                 * supersede before the next combined job. */
+                meLibDcacheWritebackInvalidateAll();
+            }
             meLibSync();
             sAudioMeState = OOT_PSP_AUDIO_ME_STATE_IDLE;
             meLibSync();
@@ -821,6 +848,10 @@ static void OotPspAudioBackend_PublishPendingMeQueue(void) {
 
 static void OotPspAudioBackend_FallbackFromMe(const Acmd* cmdList, s32 cmdCount, const s16* queueSrc,
                                               u32 queueFrames, u32 queueWritePos) {
+#if defined(OOTDEBUG) || OOT_PSP_AUDIO_DIAGNOSTICS
+    u32 buildStartUsec = 0;
+#endif
+
     sAudioMeInitialized = false;
     AUDIO_DIAG_INCREMENT(sAudioDiagnosticCpuMixes);
     AUDIO_DIAG_INCREMENT(sAudioDiagnosticMeFallbacks);
@@ -829,6 +860,27 @@ static void OotPspAudioBackend_FallbackFromMe(const Acmd* cmdList, s32 cmdCount,
     sAudioProfileCpuMixes++;
 #endif
     OotPspAudioBackend_ResetMeWriteRanges();
+    if (sAudioMePendingSynthesis) {
+        s32 publishedCmdCount = (s32)sAudioMeCmdCount;
+
+        if ((publishedCmdCount > 0) && (publishedCmdCount <= gAudioCtx.maxAudioCmds)) {
+            cmdCount = publishedCmdCount;
+            OotPspAudioBackend_InvalidateRange(cmdList, cmdCount * sizeof(*cmdList));
+            OotPspAudioSynth_InvalidateMeState();
+        } else {
+#if defined(OOTDEBUG) || OOT_PSP_AUDIO_DIAGNOSTICS
+            buildStartUsec = sceKernelGetSystemTimeLow();
+#endif
+            AudioSynth_BuildCommandList((Acmd*)cmdList, &cmdCount, (s16*)queueSrc, queueFrames);
+#if defined(OOTDEBUG) || OOT_PSP_AUDIO_DIAGNOSTICS
+            sAudioProfileCommandBuildUsec += sceKernelGetSystemTimeLow() - buildStartUsec;
+#endif
+        }
+        sAudioMePendingCmdCount = cmdCount;
+#if defined(OOTDEBUG) || OOT_PSP_AUDIO_DIAGNOSTICS
+        sAudioProfileAbiCommands += cmdCount;
+#endif
+    }
     OotPspMixer_InvalidateStateCache();
     OotPspMixer_ExecuteCommandList(cmdList, cmdCount);
     if ((queueSrc != NULL) && (queueFrames != 0)) {
@@ -840,6 +892,7 @@ static void OotPspAudioBackend_ClearPendingMeCommand(void) {
     sAudioMeCommandPending = false;
     sAudioMePendingCmdList = NULL;
     sAudioMePendingCmdCount = 0;
+    sAudioMePendingSynthesis = false;
     sAudioMePendingStartTime = 0;
     sAudioMePendingQueueSrc = NULL;
     sAudioMePendingQueueFrames = 0;
@@ -958,7 +1011,7 @@ static void OotPspAudioBackend_WaitForCommandsLocked(void) {
     }
 
 #if OOT_PSP_AUDIO_DIAGNOSTICS
-    if (sAudioMeState == OOT_PSP_AUDIO_ME_STATE_RUN) {
+    if (OotPspAudioBackend_MeJobIsRunning()) {
         diagnosticWaitStart = sceKernelGetSystemTimeLow();
         diagnosticWaited = true;
         sAudioDiagnosticMeWaitStartUsec = diagnosticWaitStart;
@@ -967,7 +1020,7 @@ static void OotPspAudioBackend_WaitForCommandsLocked(void) {
     }
 #endif
 
-    while (sAudioMeState == OOT_PSP_AUDIO_ME_STATE_RUN) {
+    while (OotPspAudioBackend_MeJobIsRunning()) {
         if (sAudioMeCompletionInterruptReady) {
             u32 elapsed = sceKernelGetSystemTimeLow() - sAudioMePendingStartTime;
             SceUInt timeout;
@@ -987,13 +1040,13 @@ static void OotPspAudioBackend_WaitForCommandsLocked(void) {
         sceKernelDelayThread(OOT_PSP_AUDIO_ME_POLL_USEC);
     }
 
-    if (sAudioMeState == OOT_PSP_AUDIO_ME_STATE_RUN) {
+    if (OotPspAudioBackend_MeJobIsRunning()) {
         u32 interruptTime;
 
         AUDIO_DIAG_INCREMENT(sAudioDiagnosticMeTimeouts);
         meLibEmitSoftwareInterrupt();
         interruptTime = sceKernelGetSystemTimeLow();
-        while ((sAudioMeState == OOT_PSP_AUDIO_ME_STATE_RUN) &&
+        while (OotPspAudioBackend_MeJobIsRunning() &&
                ((sceKernelGetSystemTimeLow() - interruptTime) < 10000)) {
             if (sAudioMeCompletionInterruptReady) {
                 u32 elapsed = sceKernelGetSystemTimeLow() - interruptTime;
@@ -1009,7 +1062,7 @@ static void OotPspAudioBackend_WaitForCommandsLocked(void) {
             }
         }
 
-        if (sAudioMeState == OOT_PSP_AUDIO_ME_STATE_RUN) {
+        if (OotPspAudioBackend_MeJobIsRunning()) {
 #if OOT_PSP_AUDIO_DIAGNOSTICS
             OotPspAudioBackend_EndDiagnosticMeWait(diagnosticWaitStart, diagnosticWaited);
 #endif
@@ -1033,9 +1086,30 @@ static void OotPspAudioBackend_WaitForCommandsLocked(void) {
         return;
     }
 
-    OotPspAudioBackend_InvalidateMeWrites(
-        sAudioMePendingCmdList, sAudioMePendingCmdCount, sAudioMePendingQueueSrc,
-        sAudioMePendingQueueFrames * OOT_PSP_AUDIO_CHANNELS * sizeof(s16));
+    if (sAudioMePendingSynthesis) {
+        s32 cmdCount = (s32)sAudioMeCmdCount;
+
+        if ((cmdCount <= 0) || (cmdCount > gAudioCtx.maxAudioCmds)) {
+            OotPspAudioBackend_FallbackFromMe(sAudioMePendingCmdList, 0, sAudioMePendingQueueSrc,
+                                              sAudioMePendingQueueFrames,
+                                              sAudioMePendingQueueWritePos);
+            OotPspAudioBackend_ClearPendingMeCommand();
+            return;
+        }
+        sAudioMePendingCmdCount = cmdCount;
+        OotPspAudioBackend_InvalidateRange(sAudioMePendingCmdList, cmdCount * sizeof(Acmd));
+        OotPspAudioSynth_InvalidateMeState();
+        OotPspAudioBackend_InvalidateMeWritesFromCommands(
+            sAudioMePendingCmdList, cmdCount, sAudioMePendingQueueSrc,
+            sAudioMePendingQueueFrames * OOT_PSP_AUDIO_CHANNELS * sizeof(s16));
+#if defined(OOTDEBUG) || OOT_PSP_AUDIO_DIAGNOSTICS
+        sAudioProfileAbiCommands += cmdCount;
+#endif
+    } else {
+        OotPspAudioBackend_InvalidateMeWrites(
+            sAudioMePendingCmdList, sAudioMePendingCmdCount, sAudioMePendingQueueSrc,
+            sAudioMePendingQueueFrames * OOT_PSP_AUDIO_CHANNELS * sizeof(s16));
+    }
     OotPspAudioBackend_PublishPendingMeQueue();
     OotPspAudioBackend_ClearPendingMeCommand();
 }
@@ -1106,6 +1180,7 @@ static void OotPspAudioBackend_SubmitCommandsInternal(const Acmd* cmdList, s32 c
     sAudioMeProgress = 0;
     sAudioMePendingCmdList = cmdList;
     sAudioMePendingCmdCount = cmdCount;
+    sAudioMePendingSynthesis = false;
     sAudioMePendingStartTime = sceKernelGetSystemTimeLow();
     sAudioMePendingQueueSrc = queueSrc;
     sAudioMePendingQueueFrames = queueFrames;
@@ -1128,6 +1203,94 @@ void OotPspAudioBackend_SubmitCommandsAndQueue(const Acmd* cmdList, s32 cmdCount
     const u32 frameBytes = sizeof(s16) * OOT_PSP_AUDIO_CHANNELS;
 
     OotPspAudioBackend_SubmitCommandsInternal(cmdList, cmdCount, buf, size / frameBytes);
+}
+
+static void OotPspAudioBackend_RunSynthesisCpu(Acmd* cmdList, s16* aiBuffer, s32 aiFrames,
+                                               u32 queueWritePos) {
+    s32 cmdCount;
+#if defined(OOTDEBUG) || OOT_PSP_AUDIO_DIAGNOSTICS
+    u32 buildStartUsec = sceKernelGetSystemTimeLow();
+#endif
+
+    AudioSynth_BuildCommandList(cmdList, &cmdCount, aiBuffer, aiFrames);
+#if defined(OOTDEBUG) || OOT_PSP_AUDIO_DIAGNOSTICS
+    sAudioProfileCommandBuildUsec += sceKernelGetSystemTimeLow() - buildStartUsec;
+    sAudioProfileAbiCommands += cmdCount;
+#endif
+    AUDIO_DIAG_INCREMENT(sAudioDiagnosticCpuMixes);
+#if defined(OOTDEBUG)
+    sAudioProfileCpuMixes++;
+#endif
+    OotPspMixer_ExecuteCommandList(cmdList, cmdCount);
+    OotPspAudioBackend_QueueCpuCopy(aiBuffer, aiFrames, queueWritePos);
+}
+
+void OotPspAudioBackend_SubmitSynthesis(Acmd* cmdList, s16* aiBuffer, s32 aiFrames) {
+    u32 queueWritePos;
+
+    if ((cmdList == NULL) || (aiBuffer == NULL) || (aiFrames <= 0)) {
+        return;
+    }
+
+    OotPspAudioBackend_LockMe();
+    OotPspAudioBackend_WaitForCommandsLocked();
+    queueWritePos = sAudioWritePos;
+    if ((u32)aiFrames > OotPspAudioBackend_FreeFrames()) {
+        /* The producer reserves maxAiBufferLength before entering the audio
+         * update. Do not overrun the ring if an out-of-band caller violates
+         * that contract. */
+        OotPspAudioBackend_UnlockMe();
+        return;
+    }
+
+    if (!sAudioMeInitialized) {
+        OotPspAudioBackend_RunSynthesisCpu(cmdList, aiBuffer, aiFrames, queueWritePos);
+        OotPspAudioBackend_UnlockMe();
+        return;
+    }
+
+    if (!AudioSynth_CanBuildCommandsOnMe()) {
+        OotPspAudioBackend_RunSynthesisCpu(cmdList, aiBuffer, aiFrames, queueWritePos);
+        OotPspAudioBackend_UnlockMe();
+        return;
+    }
+
+    if (sAudioMeState != OOT_PSP_AUDIO_ME_STATE_IDLE) {
+        sAudioMePendingSynthesis = true;
+        sAudioMeCmdCount = 0;
+        OotPspAudioBackend_FallbackFromMe(cmdList, 0, aiBuffer, aiFrames, queueWritePos);
+        sAudioMePendingSynthesis = false;
+        OotPspAudioBackend_UnlockMe();
+        return;
+    }
+
+    /* Sequence/control has finished on Allegrex. Publish all of its inputs;
+     * the ME starts from a clean cache before constructing the command list. */
+    OotPspAudioBackend_ResetMeWriteRanges();
+    sceKernelDcacheWritebackAll();
+    OotPspAudioBackend_DrainMeCompletion();
+    sAudioMeCmdList = (u32)(uintptr_t)cmdList;
+    sAudioMeCmdCount = 0;
+    sAudioMeQueueSrc = (u32)(uintptr_t)aiBuffer;
+    sAudioMeQueueFrames = aiFrames;
+    sAudioMeQueueWritePos = queueWritePos;
+    sAudioMeQueueResultWritePos = queueWritePos;
+    sAudioMeProgress = 0;
+    sAudioMePendingCmdList = cmdList;
+    sAudioMePendingCmdCount = 0;
+    sAudioMePendingSynthesis = true;
+    sAudioMePendingStartTime = sceKernelGetSystemTimeLow();
+    sAudioMePendingQueueSrc = aiBuffer;
+    sAudioMePendingQueueFrames = aiFrames;
+    sAudioMePendingQueueWritePos = queueWritePos;
+    sAudioMeCommandPending = true;
+    meLibSync();
+    sAudioMeState = OOT_PSP_AUDIO_ME_STATE_SYNTH_RUN;
+    AUDIO_DIAG_INCREMENT(sAudioDiagnosticMeSubmits);
+#if defined(OOTDEBUG)
+    sAudioProfileMeSubmits++;
+#endif
+    OotPspAudioBackend_UnlockMe();
 }
 
 void OotPspAudioBackend_ExecuteCommands(const Acmd* cmdList, s32 cmdCount) {
@@ -2049,6 +2212,8 @@ static const char* OotPspAudioBackend_MeStateName(u32 state) {
             return "IDLE";
         case OOT_PSP_AUDIO_ME_STATE_RUN:
             return "RUN";
+        case OOT_PSP_AUDIO_ME_STATE_SYNTH_RUN:
+            return "SYNTH";
         case OOT_PSP_AUDIO_ME_STATE_QUEUE_BUFFER:
             return "QUEUE";
         case OOT_PSP_AUDIO_ME_STATE_STOP:
@@ -2084,8 +2249,8 @@ static const char* OotPspAudioBackend_ProducerStateName(u32 state) {
             return "WAIT_ME";
         case OOT_PSP_AUDIO_PRODUCER_STATE_PREPARE:
             return "PREPARE";
-        case OOT_PSP_AUDIO_PRODUCER_STATE_SYNTH:
-            return "SYNTH";
+        case OOT_PSP_AUDIO_PRODUCER_STATE_SEQUENCE:
+            return "SEQUENCE";
         case OOT_PSP_AUDIO_PRODUCER_STATE_SUBMIT:
             return "SUBMIT";
         default:

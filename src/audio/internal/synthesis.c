@@ -8,9 +8,7 @@
 #include "oot_psp_asset_loader.h"
 #include "oot_psp_audio_backend.h"
 #include "oot_psp_audio_commands.h"
-#if defined(OOTDEBUG) || OOT_PSP_AUDIO_DIAGNOSTICS
 #include <pspkernel.h>
-#endif
 #endif
 
 // DMEM Addresses for the RSP
@@ -59,6 +57,7 @@ u32 sEnvMixerOp = _SHIFTL(A_ENVMIXER, 24, 8);
 #define OOT_PSP_AUDIO_REVERB_DESC_ITEMS2 1
 
 static u8 sOotPspAudioSynthBadSampleLogged;
+static u8 sOotPspAudioSynthBuildingOnMe;
 static u32 sOotPspAudioMeCacheEpoch = 1;
 static OotPspAudioReverbDownsampleCmd sOotPspAudioReverbDownsampleCmds[OOT_PSP_AUDIO_REVERB_COUNT]
                                                                              [OOT_PSP_AUDIO_REVERB_FRAMES]
@@ -77,7 +76,11 @@ static s32 OotPspAudioSynth_CanCacheSampleSpan(const void* ptr, u32 size) {
     uintptr_t end = ((uintptr_t)ptr + size + OOT_PSP_AUDIO_SAMPLE_CACHE_PAGE_SIZE - 1) &
                     ~(OOT_PSP_AUDIO_SAMPLE_CACHE_PAGE_SIZE - 1);
 
-    return OotPsp_IsLoadedNativeExternalAssetRange((const void*)start, end - start);
+    /* The loaded-asset index is owned and updated by Allegrex. The ME uses
+     * ordinary load commands while constructing a list rather than racing
+     * that index; the mixer still executes those loads on the ME. */
+    return !sOotPspAudioSynthBuildingOnMe &&
+           OotPsp_IsLoadedNativeExternalAssetRange((const void*)start, end - start);
 }
 
 static OotPspAudioReverbDownsampleCmd* OotPspAudioSynth_SetupReverbRingCmd(SynthesisReverb* reverb,
@@ -117,6 +120,31 @@ void OotPspAudioSynth_InvalidateMeCaches(void) {
     if (sOotPspAudioMeCacheEpoch == 0) {
         sOotPspAudioMeCacheEpoch = 1;
     }
+}
+
+static void OotPspAudioSynth_InvalidateRange(const void* address, u32 size) {
+    uintptr_t start;
+    uintptr_t end;
+
+    if ((address == NULL) || (size == 0)) {
+        return;
+    }
+
+    start = (uintptr_t)address & ~63U;
+    end = ((uintptr_t)address + size + 63U) & ~63U;
+    sceKernelDcacheInvalidateRange((void*)start, end - start);
+}
+
+void OotPspAudioSynth_InvalidateMeState(void) {
+    OotPspAudioSynth_InvalidateRange(
+        &gAudioCtx.curLoadedBook,
+        (uintptr_t)&gAudioCtx.synthesisReverbs[4] - (uintptr_t)&gAudioCtx.curLoadedBook);
+    OotPspAudioSynth_InvalidateRange(gAudioCtx.notes, gAudioCtx.numNotes * sizeof(*gAudioCtx.notes));
+    OotPspAudioSynth_InvalidateRange(
+        gAudioCtx.noteSubsEu,
+        gAudioCtx.audioBufferParameters.ticksPerUpdate * gAudioCtx.numNotes * sizeof(*gAudioCtx.noteSubsEu));
+    OotPspAudioSynth_InvalidateRange(sOotPspAudioReverbDownsampleCmds,
+                                     sizeof(sOotPspAudioReverbDownsampleCmds));
 }
 #endif
 
@@ -266,30 +294,24 @@ void func_800DB03C(s32 updateIndex) {
     }
 }
 
-/**
- * original name: Nas_smzAudioFrame
- */
-Acmd* AudioSynth_Update(Acmd* cmdStart, s32* cmdCnt, s16* aiStart, s32 aiBufLen) {
+void AudioSynth_ProcessSequenceControl(void) {
+    s32 i;
+
+    for (i = gAudioCtx.audioBufferParameters.ticksPerUpdate; i > 0; i--) {
+        AudioSeq_ProcessSequences(i - 1);
+        func_800DB03C(gAudioCtx.audioBufferParameters.ticksPerUpdate - i);
+    }
+}
+
+Acmd* AudioSynth_BuildCommandList(Acmd* cmdStart, s32* cmdCnt, s16* aiStart, s32 aiBufLen) {
     s32 chunkLen;
     s16* aiBufP;
     Acmd* cmdP;
     s32 i;
     s32 j;
     SynthesisReverb* reverb;
-#if defined(TARGET_PSP) && (defined(OOTDEBUG) || OOT_PSP_AUDIO_DIAGNOSTICS)
-    u32 profileStartUsec = sceKernelGetSystemTimeLow();
-    u32 profileAfterSequenceUsec;
-#endif
 
     cmdP = cmdStart;
-    for (i = gAudioCtx.audioBufferParameters.ticksPerUpdate; i > 0; i--) {
-        AudioSeq_ProcessSequences(i - 1);
-        func_800DB03C(gAudioCtx.audioBufferParameters.ticksPerUpdate - i);
-    }
-#if defined(TARGET_PSP) && (defined(OOTDEBUG) || OOT_PSP_AUDIO_DIAGNOSTICS)
-    profileAfterSequenceUsec = sceKernelGetSystemTimeLow();
-#endif
-
     aiBufP = aiStart;
     gAudioCtx.curLoadedBook = NULL;
 
@@ -323,11 +345,70 @@ Acmd* AudioSynth_Update(Acmd* cmdStart, s32* cmdCnt, s16* aiStart, s32 aiBufLen)
     }
 
     *cmdCnt = cmdP - cmdStart;
+    return cmdP;
+}
+
+#if defined(TARGET_PSP)
+Acmd* AudioSynth_BuildCommandListMe(Acmd* cmdStart, s32* cmdCnt, s16* aiStart, s32 aiBufLen) {
+    Acmd* cmdEnd;
+
+    sOotPspAudioSynthBuildingOnMe = true;
+    cmdEnd = AudioSynth_BuildCommandList(cmdStart, cmdCnt, aiStart, aiBufLen);
+    sOotPspAudioSynthBuildingOnMe = false;
+    return cmdEnd;
+}
+
+s32 AudioSynth_CanBuildCommandsOnMe(void) {
+    s32 noteSubCount = gAudioCtx.audioBufferParameters.ticksPerUpdate * gAudioCtx.numNotes;
+    s32 i;
+
+    for (i = 0; i < noteSubCount; i++) {
+        NoteSubEu* noteSubEu = &gAudioCtx.noteSubsEu[i];
+        TunedSample* tunedSample;
+        Sample* sample;
+
+        if (!noteSubEu->bitField0.enabled || noteSubEu->bitField1.isSyntheticWave) {
+            continue;
+        }
+
+        tunedSample = noteSubEu->tunedSample;
+        if ((tunedSample == NULL) || !OotPspAudioSynth_IsAlignedNativePtr(tunedSample) ||
+            (tunedSample->sample == NULL) || !OotPspAudioSynth_IsAlignedNativePtr(tunedSample->sample)) {
+            continue;
+        }
+
+        sample = tunedSample->sample;
+        if ((sample->medium != MEDIUM_RAM) && (sample->medium != MEDIUM_UNK) &&
+            (sample->codec != CODEC_S16_INMEMORY) && (sample->codec != CODEC_S16)) {
+            /* This update may call AudioLoad_DmaSampleData while constructing
+             * commands. Keep that I/O-capable path on Allegrex. */
+            return false;
+        }
+    }
+
+    return true;
+}
+#endif
+
+/**
+ * original name: Nas_smzAudioFrame
+ */
+Acmd* AudioSynth_Update(Acmd* cmdStart, s32* cmdCnt, s16* aiStart, s32 aiBufLen) {
 #if defined(TARGET_PSP) && (defined(OOTDEBUG) || OOT_PSP_AUDIO_DIAGNOSTICS)
+    u32 profileStartUsec = sceKernelGetSystemTimeLow();
+    u32 profileAfterSequenceUsec;
+    Acmd* cmdEnd;
+
+    AudioSynth_ProcessSequenceControl();
+    profileAfterSequenceUsec = sceKernelGetSystemTimeLow();
+    cmdEnd = AudioSynth_BuildCommandList(cmdStart, cmdCnt, aiStart, aiBufLen);
     OotPspAudioBackend_RecordSynthesisProfile(profileAfterSequenceUsec - profileStartUsec,
                                               sceKernelGetSystemTimeLow() - profileAfterSequenceUsec);
+    return cmdEnd;
+#else
+    AudioSynth_ProcessSequenceControl();
+    return AudioSynth_BuildCommandList(cmdStart, cmdCnt, aiStart, aiBufLen);
 #endif
-    return cmdP;
 }
 
 /**
@@ -350,7 +431,7 @@ void func_800DB2C0(s32 updateIndex, s32 noteIndex) {
 #if defined(TARGET_PSP)
 static Acmd* OotPspAudioSynth_DropBadNote(Acmd* cmd, s32 updateIndex, s32 noteIndex, NoteSubEu* noteSubEu, Note* note,
                                           const char* reason, TunedSample* tunedSample, Sample* sample) {
-    if (!sOotPspAudioSynthBadSampleLogged) {
+    if (!sOotPspAudioSynthBuildingOnMe && !sOotPspAudioSynthBadSampleLogged) {
         sOotPspAudioSynthBadSampleLogged = true;
         osSyncPrintf("oot-psp audio dropped bad synth note reason=%s note=%d tuned=%p sample=%p\n", reason, noteIndex,
                      tunedSample, sample);
@@ -1154,7 +1235,8 @@ Acmd* AudioSynth_ProcessNote(s32 noteIndex, NoteSubEu* noteSubEu, NoteSynthesisS
                     if (1) {}
                     nEntries = SAMPLES_PER_FRAME * sample->book->header.order * sample->book->header.numPredictors;
 #if defined(TARGET_PSP)
-                    if (OotPsp_IsLoadedNativeExternalAssetRange(gAudioCtx.curLoadedBook, nEntries)) {
+                    if (!sOotPspAudioSynthBuildingOnMe &&
+                        OotPsp_IsLoadedNativeExternalAssetRange(gAudioCtx.curLoadedBook, nEntries)) {
                         aOotPspAudioLoadAdpcmCached(cmd++, nEntries, gAudioCtx.curLoadedBook);
                     } else {
                         aLoadADPCM(cmd++, nEntries, gAudioCtx.curLoadedBook);
@@ -1253,6 +1335,13 @@ Acmd* AudioSynth_ProcessNote(s32 noteIndex, NoteSubEu* noteSubEu, NoteSynthesisS
                     } else if (sample->medium == MEDIUM_UNK) {
                         return cmd;
                     } else {
+#if defined(TARGET_PSP)
+                        if (sOotPspAudioSynthBuildingOnMe) {
+                            return OotPspAudioSynth_DropBadNote(cmd, updateIndex, noteIndex, noteSubEu,
+                                                               &gAudioCtx.notes[noteIndex], "ME nonresident sample",
+                                                               tunedSample, sample);
+                        }
+#endif
                         sampleData = AudioLoad_DmaSampleData(sampleDataStart + sampleDataOffset + sampleAddr,
                                                              ALIGN16((nFramesToDecode * frameSize) + SAMPLES_PER_FRAME),
                                                              flags, &synthState->sampleDmaIndex, sample->medium);
