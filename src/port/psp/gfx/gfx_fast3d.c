@@ -208,7 +208,7 @@ struct TriPipelineState {
     bool two_texture_alpha_blend;
     bool flame_texture_atlas;
     bool texture_tint_uses_prim_lod;
-    bool texture_tint_uncompensated_alpha;
+    bool two_texture_uncompensated_alpha;
     struct RGBA texture_tint_env_color;
     bool color_mul_env;
     bool color_mul_prim;
@@ -3067,13 +3067,15 @@ static void gfx_prepare_tri_pipeline_state(void) {
     struct RGBA textureTintPrimColor = rdp.prim_color;
     struct RGBA textureTintEnvColor = rdp.env_color;
     bool textureTintUsesPrimLod = false;
-    bool textureTintUncompensatedAlpha = false;
+    bool twoTextureUncompensatedAlpha = false;
 #if defined(TARGET_PSP)
+    twoTextureUncompensatedAlpha =
+        rdp.combine_two_texture_blend && rdp.combine_two_texture_alpha_blend &&
+        gfx_two_intensity_tint_textures_are_supported();
     if (rdp.combine_texture_tint_uses_prim_lod) {
         if (rdp.combine_two_texture_blend &&
             gfx_get_two_texture_prim_lod_tint_colors(&textureTintPrimColor, &textureTintEnvColor)) {
             textureTintUsesPrimLod = true;
-            textureTintUncompensatedAlpha = true;
         } else if (!rdp.combine_two_texture_blend) {
             textureTintUsesPrimLod =
                 gfx_get_single_texture_prim_lod_tint_colors(&textureTintPrimColor, &textureTintEnvColor);
@@ -3182,7 +3184,7 @@ static void gfx_prepare_tri_pipeline_state(void) {
     state->two_texture_alpha_blend = rdp.combine_two_texture_alpha_blend;
     state->flame_texture_atlas = flame_texture_atlas;
     state->texture_tint_uses_prim_lod = textureTintUsesPrimLod;
-    state->texture_tint_uncompensated_alpha = textureTintUncompensatedAlpha;
+    state->two_texture_uncompensated_alpha = twoTextureUncompensatedAlpha;
     state->texture_tint_env_color = textureTintEnvColor;
     state->color_mul_env = rdp.combine_color_mul_env;
     state->color_mul_prim = rdp.combine_color_mul_prim;
@@ -4018,7 +4020,7 @@ static void gfx_sp_triangles(uint32_t packed0, uint32_t packed1, uint8_t triangl
                                          : rdp.env_color.a;
 
             gfx_two_texture_blend_pass_alphas(out->color.a, mixAlpha, state->two_texture_alpha_blend,
-                                              state->texture_tint_uncompensated_alpha, &baseAlpha,
+                                              state->two_texture_uncompensated_alpha, &baseAlpha,
                                               &overlayAlpha);
             out->color.a = baseAlpha;
             buf_vbo_tex1[buf_num_vert].alpha = overlayAlpha;
@@ -4036,7 +4038,7 @@ static void gfx_sp_triangles(uint32_t packed0, uint32_t packed1, uint8_t triangl
                                              : rdp.env_color.a;
 
                 gfx_two_texture_blend_pass_alphas(fogOut->color.a, mixAlpha, true,
-                                                  state->texture_tint_uncompensated_alpha, &baseAlpha,
+                                                  state->two_texture_uncompensated_alpha, &baseAlpha,
                                                   &overlayAlpha);
                 fogOut->color.a = baseAlpha;
                 buf_vbo_fog_tex1_alpha[buf_num_vert] = overlayAlpha;
@@ -4738,6 +4740,21 @@ static bool gfx_cc_is_two_texture_prim_lod_tint(uint32_t rgbA0, uint32_t rgbB0, 
            gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1);
 }
 
+static bool gfx_cc_is_two_texture_self_modulated_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
+                                                       uint32_t rgbD0, uint32_t alphaA0, uint32_t alphaB0,
+                                                       uint32_t alphaC0, uint32_t alphaD0, uint32_t rgbA1,
+                                                       uint32_t rgbB1, uint32_t rgbC1, uint32_t rgbD1,
+                                                       uint32_t alphaA1, uint32_t alphaB1, uint32_t alphaC1,
+                                                       uint32_t alphaD1) {
+    return (rgbA0 == G_CCMUX_TEXEL1) && (rgbB0 == G_CCMUX_PRIMITIVE) &&
+           (rgbC0 == G_CCMUX_TEXEL0) && (rgbD0 == G_CCMUX_TEXEL0) &&
+           gfx_cc_is_alpha_two_texture_blend(alphaA0, alphaB0, alphaC0, alphaD0,
+                                              G_ACMUX_PRIM_LOD_FRAC) &&
+           (rgbA1 == G_CCMUX_PRIMITIVE) && (rgbB1 == G_CCMUX_ENVIRONMENT) &&
+           (rgbC1 == G_CCMUX_COMBINED) && (rgbD1 == G_CCMUX_ENVIRONMENT) &&
+           gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1);
+}
+
 static bool gfx_cc_is_single_texture_prim_lod_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
                                                    uint32_t rgbD0, uint32_t rgbA1, uint32_t rgbB1,
                                                    uint32_t rgbC1, uint32_t rgbD1) {
@@ -4900,6 +4917,20 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
     if (textureTintUsesPrimLod) {
         /* Both intensity maps contribute RGB and alpha. Weight each directly by PRIM_LOD_FRAC; the generic
          * two-pass compensation assumes an opaque TEXEL0 and makes translucent intensity pairs too bright. */
+        twoTextureBlend = true;
+        twoTextureBlendUsesPrimLod = true;
+        twoTextureAlphaBlend = true;
+    }
+
+    if (gfx_cc_is_two_texture_self_modulated_tint(rgbA0, rgbB0, rgbC0, rgbD0, alphaA0, alphaB0,
+                                                   alphaC0, alphaD0, rgbA1, rgbB1, rgbC1, rgbD1,
+                                                   alphaA1, alphaB1, alphaC1, alphaD1)) {
+        /* Effects such as the treasure-chest light rays use two intensity maps for coverage and multiply the
+         * interpolated result by the animated PRIMITIVE alpha. Preserve both maps with the two GU passes; the
+         * compact one-texture fallback otherwise turns the fading glow into a solid sheet. */
+        rgbComb = color_comb(G_CCMUX_TEXEL0, G_CCMUX_0, G_CCMUX_PRIMITIVE, G_CCMUX_0);
+        alphaComb = color_comb(G_ACMUX_TEXEL0, G_ACMUX_0, G_ACMUX_PRIMITIVE, G_ACMUX_0);
+        textureBlend = true;
         twoTextureBlend = true;
         twoTextureBlendUsesPrimLod = true;
         twoTextureAlphaBlend = true;
