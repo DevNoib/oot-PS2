@@ -4725,6 +4725,11 @@ static bool gfx_cc_is_combined_mul_primitive(uint32_t a, uint32_t b, uint32_t c,
            (d == G_ACMUX_0);
 }
 
+static bool gfx_cc_is_combined_mul_shade(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    return (a == G_ACMUX_COMBINED) && (b == G_ACMUX_0) && (c == G_ACMUX_SHADE) &&
+           (d == G_ACMUX_0);
+}
+
 static bool gfx_cc_is_two_texture_prim_lod_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
                                                 uint32_t rgbD0, uint32_t alphaA0, uint32_t alphaB0,
                                                 uint32_t alphaC0, uint32_t alphaD0, uint32_t rgbA1,
@@ -4907,9 +4912,15 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
                                           twoTextureBlendUsesPrimLod ? G_ACMUX_LOD_FRACTION
                                                                      : G_ACMUX_ENVIRONMENT)) {
         /* The GU pass samples TEXEL0 first and TEXEL1 second. Canonicalize the
-         * alpha combiner so each pass takes alpha from its currently-bound
-         * texture; the CPU supplies the cycle-2 ENVIRONMENT multiplier. */
-        alphaComb = color_comb(G_ACMUX_0, G_ACMUX_0, G_ACMUX_0, G_ACMUX_TEXEL0);
+         * alpha combiner so each pass takes alpha from its currently-bound texture. Preserve cycle-two
+         * PRIMITIVE or SHADE opacity here; the CPU separately supplies an ENVIRONMENT multiplier. */
+        if (gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1)) {
+            alphaComb = color_comb(G_ACMUX_TEXEL0, G_ACMUX_0, G_ACMUX_PRIMITIVE, G_ACMUX_0);
+        } else if (gfx_cc_is_combined_mul_shade(alphaA1, alphaB1, alphaC1, alphaD1)) {
+            alphaComb = color_comb(G_ACMUX_TEXEL0, G_ACMUX_0, G_ACMUX_SHADE, G_ACMUX_0);
+        } else {
+            alphaComb = color_comb(G_ACMUX_0, G_ACMUX_0, G_ACMUX_0, G_ACMUX_TEXEL0);
+        }
         twoTextureAlphaBlend = true;
     }
 
