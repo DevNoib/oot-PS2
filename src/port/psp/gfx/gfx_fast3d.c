@@ -4755,6 +4755,21 @@ static bool gfx_cc_is_two_texture_self_modulated_tint(uint32_t rgbA0, uint32_t r
            gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1);
 }
 
+static bool gfx_cc_is_two_texture_lod_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
+                                           uint32_t rgbD0, uint32_t alphaA0, uint32_t alphaB0,
+                                           uint32_t alphaC0, uint32_t alphaD0, uint32_t rgbA1,
+                                           uint32_t rgbB1, uint32_t rgbC1, uint32_t rgbD1,
+                                           uint32_t alphaA1, uint32_t alphaB1, uint32_t alphaC1,
+                                           uint32_t alphaD1) {
+    return (rgbA0 == G_CCMUX_TEXEL1) && (rgbB0 == G_CCMUX_TEXEL0) &&
+           (rgbC0 == G_CCMUX_LOD_FRACTION) && (rgbD0 == G_CCMUX_TEXEL0) &&
+           gfx_cc_is_alpha_two_texture_blend(alphaA0, alphaB0, alphaC0, alphaD0,
+                                              G_ACMUX_LOD_FRACTION) &&
+           (rgbA1 == G_CCMUX_PRIMITIVE) && (rgbB1 == G_CCMUX_ENVIRONMENT) &&
+           (rgbC1 == G_CCMUX_COMBINED) && (rgbD1 == G_CCMUX_ENVIRONMENT) &&
+           gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1);
+}
+
 static bool gfx_cc_is_single_texture_prim_lod_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
                                                    uint32_t rgbD0, uint32_t rgbA1, uint32_t rgbB1,
                                                    uint32_t rgbC1, uint32_t rgbD1) {
@@ -4928,6 +4943,19 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
         /* Effects such as the treasure-chest light rays use two intensity maps for coverage and multiply the
          * interpolated result by the animated PRIMITIVE alpha. Preserve both maps with the two GU passes; the
          * compact one-texture fallback otherwise turns the fading glow into a solid sheet. */
+        rgbComb = color_comb(G_CCMUX_TEXEL0, G_CCMUX_0, G_CCMUX_PRIMITIVE, G_CCMUX_0);
+        alphaComb = color_comb(G_ACMUX_TEXEL0, G_ACMUX_0, G_ACMUX_PRIMITIVE, G_ACMUX_0);
+        textureBlend = true;
+        twoTextureBlend = true;
+        twoTextureBlendUsesPrimLod = true;
+        twoTextureAlphaBlend = true;
+    }
+
+    if (gfx_cc_is_two_texture_lod_tint(rgbA0, rgbB0, rgbC0, rgbD0, alphaA0, alphaB0, alphaC0,
+                                       alphaD0, rgbA1, rgbB1, rgbC1, rgbD1, alphaA1, alphaB1,
+                                       alphaC1, alphaD1)) {
+        /* Fixed-LOD portal materials program PRIM_LOD_FRAC as the two-tile blend factor. Leaving LOD_FRACTION
+         * in the compact PSP combiner incorrectly turns it into distance shading, making nearby glows black. */
         rgbComb = color_comb(G_CCMUX_TEXEL0, G_CCMUX_0, G_CCMUX_PRIMITIVE, G_CCMUX_0);
         alphaComb = color_comb(G_ACMUX_TEXEL0, G_ACMUX_0, G_ACMUX_PRIMITIVE, G_ACMUX_0);
         textureBlend = true;
