@@ -207,6 +207,9 @@ struct TriPipelineState {
     bool two_texture_blend_uses_prim_lod;
     bool two_texture_alpha_blend;
     bool flame_texture_atlas;
+    bool texture_tint_uses_prim_lod;
+    bool texture_tint_uncompensated_alpha;
+    struct RGBA texture_tint_env_color;
     bool color_mul_env;
     bool color_mul_prim;
     bool alpha_mul_env;
@@ -292,6 +295,7 @@ static struct RDP {
     bool combine_two_texture_alpha_blend;
     bool combine_alpha_mul_env;
     bool combine_flame_texture_atlas;
+    bool combine_texture_tint_uses_prim_lod;
     
     struct RGBA env_color, prim_color, fog_color, fill_color;
     uint8_t prim_lod_frac;
@@ -841,8 +845,9 @@ static psp_uv_t buf_vbo_tex1[MAX_BUFFERED * 3] __attribute__((aligned(32)));
 static psp_fog_t buf_vbo_fog[MAX_BUFFERED * 3] __attribute__((aligned(32)));
 static uint8_t buf_vbo_fog_tex1_alpha[MAX_BUFFERED * 3] __attribute__((aligned(32)));
 static GFX_DL_HANDLER void gfx_two_texture_blend_pass_alphas(uint8_t surfaceAlpha, uint8_t mixAlpha,
-                                                             bool blendTextureAlpha, uint8_t* baseAlpha,
-                                                             uint8_t* overlayAlpha);
+                                                             bool blendTextureAlpha,
+                                                             bool uncompensatedTextureAlpha,
+                                                             uint8_t* baseAlpha, uint8_t* overlayAlpha);
 #else
 static float buf_vbo[MAX_BUFFERED * (26 * 3)] // 3 vertices in a triangle and 26 floats per vtx
 #endif
@@ -1606,17 +1611,27 @@ static inline void gfx_color_mul_prim(struct RGBA* color) {
 
 #if defined(TARGET_PSP)
 static GFX_DL_HANDLER void gfx_two_texture_blend_pass_alphas(uint8_t surfaceAlpha, uint8_t mixAlpha,
-                                                             bool blendTextureAlpha, uint8_t* baseAlpha,
-                                                             uint8_t* overlayAlpha) {
+                                                             bool blendTextureAlpha,
+                                                             bool uncompensatedTextureAlpha,
+                                                             uint8_t* baseAlpha, uint8_t* overlayAlpha) {
     uint32_t base;
     uint32_t overlay;
     uint32_t denominator;
 
     if (blendTextureAlpha) {
+        base = ((uint32_t)surfaceAlpha * (255 - mixAlpha) + 127) / 255;
+        if (uncompensatedTextureAlpha) {
+            /* Both intensity textures contain coverage. Weight each pass directly so their combined
+             * transparency follows the RDP crossfade instead of treating TEXEL0 as opaque. */
+            overlay = ((uint32_t)surfaceAlpha * mixAlpha + 127) / 255;
+            *baseAlpha = base;
+            *overlayAlpha = overlay;
+            return;
+        }
+
         /* Draw TEXEL0 first, then TEXEL1. This ordering preserves
          * lerp(TEXEL0.a, TEXEL1.a, mix) when TEXEL0 is opaque, as it is for
          * the Dark Link room's water layer. */
-        base = ((uint32_t)surfaceAlpha * (255 - mixAlpha) + 127) / 255;
         denominator = 255 - base;
         overlay = 0;
 
@@ -2435,6 +2450,302 @@ static void import_texture(int tile) {
 }
 
 #if defined(TARGET_PSP)
+static bool gfx_intensity_tint_texture_is_supported(int tile) {
+    const TextureTileState* texture = gfx_get_texture_tile(tile);
+    uint32_t width;
+    uint32_t height;
+
+    if ((texture->fmt != G_IM_FMT_I) ||
+        ((texture->siz != G_IM_SIZ_4b) && (texture->siz != G_IM_SIZ_8b))) {
+        return false;
+    }
+
+    if (!gfx_try_loaded_texture_dimensions(tile, &width, &height)) {
+        gfx_texture_import_dimensions(tile, &width, &height);
+    }
+
+    return gfx_texture_tile_dimensions_fit_source(tile, width, height) &&
+           gfx_texture_tile_dimensions_fit_import(tile, width, height);
+}
+
+static bool gfx_two_intensity_tint_textures_are_supported(void) {
+    return gfx_intensity_tint_texture_is_supported(0) && gfx_intensity_tint_texture_is_supported(1);
+}
+
+#define GFX_INTENSITY_TINT_CACHE_SIZE 16
+#define GFX_INTENSITY_TINT_CACHE_SINGLE 0
+#define GFX_INTENSITY_TINT_CACHE_TWO 1
+
+typedef struct GfxIntensityTintCacheEntry {
+    const uint8_t* addr;
+    uint32_t sourceSerial;
+    uint32_t sourceSpan;
+    uint32_t rowStride;
+    uint32_t sizeBytes;
+    uint32_t width;
+    uint32_t height;
+    struct RGBA inputPrimColor;
+    struct RGBA inputEnvColor;
+    struct RGBA outputPrimColor;
+    struct RGBA outputEnvColor;
+    uint8_t sourceNibbleOffset;
+    uint8_t siz;
+    uint8_t primLodFrac;
+    uint8_t mode;
+    bool valid;
+} GfxIntensityTintCacheEntry;
+
+static GfxIntensityTintCacheEntry sIntensityTintCache[GFX_INTENSITY_TINT_CACHE_SIZE];
+static uint8_t sIntensityTintCacheNext;
+
+static bool gfx_intensity_tint_cache_lookup(uint8_t mode, int tile, uint32_t width, uint32_t height,
+                                            struct RGBA* primColor, struct RGBA* envColor) {
+    const uint8_t* addr = rdp.loaded_texture[tile].addr;
+    const uint32_t sourceSpan = gfx_texture_source_span_size(tile);
+    const uint32_t sourceSerial = OotPsp_GetExternalAssetRangeSerial(addr, sourceSpan);
+
+    if ((sourceSerial == 0) && OotPsp_IsRuntimeByteRange(addr, sourceSpan)) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < GFX_INTENSITY_TINT_CACHE_SIZE; i++) {
+        const GfxIntensityTintCacheEntry* entry = &sIntensityTintCache[i];
+
+        if (entry->valid && (entry->mode == mode) && (entry->addr == addr) &&
+            (entry->sourceSerial == sourceSerial) && (entry->sourceSpan == sourceSpan) &&
+            (entry->rowStride == rdp.loaded_texture[tile].row_stride_bytes) &&
+            (entry->sizeBytes == rdp.loaded_texture[tile].size_bytes) && (entry->width == width) &&
+            (entry->height == height) &&
+            (entry->sourceNibbleOffset == rdp.loaded_texture[tile].source_nibble_offset) &&
+            (entry->siz == gfx_get_texture_tile(tile)->siz) && (entry->primLodFrac == rdp.prim_lod_frac) &&
+            (entry->inputPrimColor.r == rdp.prim_color.r) &&
+            (entry->inputPrimColor.g == rdp.prim_color.g) &&
+            (entry->inputPrimColor.b == rdp.prim_color.b) &&
+            (entry->inputEnvColor.r == rdp.env_color.r) &&
+            (entry->inputEnvColor.g == rdp.env_color.g) &&
+            (entry->inputEnvColor.b == rdp.env_color.b)) {
+            *primColor = entry->outputPrimColor;
+            *envColor = entry->outputEnvColor;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void gfx_intensity_tint_cache_store(uint8_t mode, int tile, uint32_t width, uint32_t height,
+                                           const struct RGBA* primColor, const struct RGBA* envColor) {
+    const uint8_t* addr = rdp.loaded_texture[tile].addr;
+    const uint32_t sourceSpan = gfx_texture_source_span_size(tile);
+    const uint32_t sourceSerial = OotPsp_GetExternalAssetRangeSerial(addr, sourceSpan);
+    GfxIntensityTintCacheEntry* entry;
+
+    if ((sourceSerial == 0) && OotPsp_IsRuntimeByteRange(addr, sourceSpan)) {
+        return;
+    }
+
+    entry = &sIntensityTintCache[sIntensityTintCacheNext];
+    sIntensityTintCacheNext = (sIntensityTintCacheNext + 1) % GFX_INTENSITY_TINT_CACHE_SIZE;
+    entry->addr = addr;
+    entry->sourceSerial = sourceSerial;
+    entry->sourceSpan = sourceSpan;
+    entry->rowStride = rdp.loaded_texture[tile].row_stride_bytes;
+    entry->sizeBytes = rdp.loaded_texture[tile].size_bytes;
+    entry->width = width;
+    entry->height = height;
+    entry->inputPrimColor = rdp.prim_color;
+    entry->inputEnvColor = rdp.env_color;
+    entry->outputPrimColor = *primColor;
+    entry->outputEnvColor = *envColor;
+    entry->sourceNibbleOffset = rdp.loaded_texture[tile].source_nibble_offset;
+    entry->siz = gfx_get_texture_tile(tile)->siz;
+    entry->primLodFrac = rdp.prim_lod_frac;
+    entry->mode = mode;
+    entry->valid = true;
+}
+
+static int32_t gfx_div_round_nearest_s64(int64_t numerator, int64_t denominator) {
+    return numerator >= 0 ? (numerator + denominator / 2) / denominator
+                          : -((-numerator + denominator / 2) / denominator);
+}
+
+static bool gfx_get_single_texture_prim_lod_tint_colors(struct RGBA* primColor, struct RGBA* envColor) {
+    const TextureTileState* texture0 = gfx_get_texture_tile(0);
+    uint64_t intensitySum = 0;
+    uint64_t intensitySquaredSum = 0;
+    int64_t colorSum[3] = { 0 };
+    int64_t intensityColorSum[3] = { 0 };
+    uint32_t width;
+    uint32_t height;
+    uint32_t texelCount;
+    uint32_t rowBytes;
+    GfxTextureSwapState swapState;
+
+    if (!gfx_intensity_tint_texture_is_supported(0) ||
+        !gfx_validate_texture_source(0, "single-prim-lod-tint-texture0") ||
+        !gfx_try_loaded_texture_dimensions(0, &width, &height) ||
+        (height > (UINT32_MAX / width))) {
+        return false;
+    }
+
+    if (gfx_intensity_tint_cache_lookup(GFX_INTENSITY_TINT_CACHE_SINGLE, 0, width, height, primColor,
+                                        envColor)) {
+        return true;
+    }
+
+    texelCount = width * height;
+    rowBytes = gfx_texture_row_bytes(width + rdp.loaded_texture[0].source_nibble_offset, texture0->siz);
+    swapState = gfx_texture_source_swap_state(rdp.loaded_texture[0].addr, gfx_texture_source_span_size(0));
+
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t* row = gfx_texture_row(0, y, rowBytes);
+
+        for (uint32_t x = 0; x < width; x++) {
+            const int32_t intensity = texture0->siz == G_IM_SIZ_4b
+                                          ? gfx_texture_read_4b(0, x, row, &swapState) * 0x11
+                                          : gfx_read_texture_source_u8(row, x, &swapState);
+
+            intensitySum += intensity;
+            intensitySquaredSum += intensity * intensity;
+            for (uint32_t channel = 0; channel < 3; channel++) {
+                const int32_t prim = ((const uint8_t*)&rdp.prim_color)[channel];
+                const int32_t env = ((const uint8_t*)&rdp.env_color)[channel];
+                int32_t combinedNumerator =
+                    intensity * 256 + (intensity - prim) * rdp.prim_lod_frac;
+
+                combinedNumerator = combinedNumerator < 0 ? 0 :
+                                    (combinedNumerator > 255 * 256 ? 255 * 256 : combinedNumerator);
+                const int32_t combined = (combinedNumerator + 128) / 256;
+                const int32_t color =
+                    env + gfx_div_round_nearest_s64((int64_t)(prim - env) * combined, 255);
+
+                colorSum[channel] += color;
+                intensityColorSum[channel] += intensity * color;
+            }
+        }
+    }
+
+    const int64_t denominator =
+        (int64_t)texelCount * intensitySquaredSum - (int64_t)intensitySum * intensitySum;
+    if (denominator == 0) {
+        return false;
+    }
+
+    *primColor = rdp.prim_color;
+    *envColor = rdp.env_color;
+
+    /*
+     * These single-texture materials use
+     *
+     *   TEXEL0 + (TEXEL0 - PRIMITIVE) * PRIM_LOD_FRAC
+     *
+     * before tinting between ENVIRONMENT and PRIMITIVE. Fit the GU's one-cycle tint endpoints to that result
+     * over the material's actual intensity distribution. Including the RDP first-cycle clamp keeps the bright
+     * highlights at their programmed PRIMITIVE color while restoring the intended low-intensity endpoint.
+     */
+    for (uint32_t channel = 0; channel < 3; channel++) {
+        const int64_t slopeNumerator =
+            (int64_t)texelCount * intensityColorSum[channel] -
+            (int64_t)intensitySum * colorSum[channel];
+        const int64_t envNumerator =
+            colorSum[channel] * (int64_t)intensitySquaredSum -
+            (int64_t)intensitySum * intensityColorSum[channel];
+        int32_t correctedEnv = gfx_div_round_nearest_s64(envNumerator, denominator);
+        int32_t correctedPrim =
+            gfx_div_round_nearest_s64(envNumerator + 255 * slopeNumerator, denominator);
+
+        correctedPrim = correctedPrim < 0 ? 0 : (correctedPrim > 255 ? 255 : correctedPrim);
+        correctedEnv = correctedEnv < 0 ? 0 : (correctedEnv > 255 ? 255 : correctedEnv);
+        ((uint8_t*)primColor)[channel] = correctedPrim;
+        ((uint8_t*)envColor)[channel] = correctedEnv;
+    }
+
+    gfx_intensity_tint_cache_store(GFX_INTENSITY_TINT_CACHE_SINGLE, 0, width, height, primColor, envColor);
+
+    return true;
+}
+
+static bool gfx_get_two_texture_prim_lod_tint_colors(struct RGBA* primColor, struct RGBA* envColor) {
+    const TextureTileState* texture0 = gfx_get_texture_tile(0);
+    uint32_t width;
+    uint32_t height;
+    uint32_t rowBytes;
+    uint64_t intensitySum = 0;
+    uint32_t texelCount;
+    uint8_t meanIntensity;
+    GfxTextureSwapState swapState;
+
+    if (!gfx_two_intensity_tint_textures_are_supported() ||
+        !gfx_validate_texture_source(0, "two-prim-lod-tint-texture0")) {
+        return false;
+    }
+
+    if (!gfx_try_loaded_texture_dimensions(0, &width, &height) ||
+        !gfx_texture_tile_dimensions_fit_source(0, width, height) ||
+        !gfx_texture_tile_dimensions_fit_import(0, width, height)) {
+        gfx_validate_texture_tile_dimensions(0, "two-prim-lod-tint-texture0-dimensions");
+        gfx_texture_import_dimensions(0, &width, &height);
+    }
+    if ((width == 0) || (height == 0) || (height > (UINT32_MAX / width))) {
+        return false;
+    }
+
+    if (gfx_intensity_tint_cache_lookup(GFX_INTENSITY_TINT_CACHE_TWO, 0, width, height, primColor,
+                                        envColor)) {
+        return true;
+    }
+
+    texelCount = width * height;
+    rowBytes = gfx_texture_row_bytes(width + rdp.loaded_texture[0].source_nibble_offset, texture0->siz);
+    swapState = gfx_texture_source_swap_state(rdp.loaded_texture[0].addr, gfx_texture_source_span_size(0));
+
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t* row = gfx_texture_row(0, y, rowBytes);
+
+        for (uint32_t x = 0; x < width; x++) {
+            if (texture0->siz == G_IM_SIZ_4b) {
+                intensitySum += gfx_texture_read_4b(0, x, row, &swapState) * 0x11U;
+            } else {
+                intensitySum += gfx_read_texture_source_u8(row, x, &swapState);
+            }
+        }
+    }
+
+    meanIntensity = (intensitySum + texelCount / 2) / texelCount;
+    *primColor = rdp.prim_color;
+    *envColor = rdp.env_color;
+
+    /*
+     * The two GU passes reproduce lerp(TEXEL0, TEXEL1, PRIM_LOD_FRAC), while this RDP first cycle is
+     *
+     *   TEXEL0 + (TEXEL1 - PRIMITIVE) * PRIM_LOD_FRAC
+     *
+     * Their difference is PRIM_LOD_FRAC * (TEXEL0 - PRIMITIVE). Fold TEXEL0's mean difference into both tint
+     * endpoints. This preserves the animated two-texture detail without biasing the result toward the pale
+     * PRIMITIVE endpoint.
+     */
+    for (uint32_t channel = 0; channel < 3; channel++) {
+        const int32_t prim = ((const uint8_t*)&rdp.prim_color)[channel];
+        const int32_t env = ((const uint8_t*)&rdp.env_color)[channel];
+        const int64_t numerator =
+            (int64_t)(prim - env) * (meanIntensity - prim) * rdp.prim_lod_frac;
+        const int32_t denominator = 255 * 256;
+        const int32_t correction = numerator >= 0 ? (numerator + denominator / 2) / denominator
+                                                   : -((-numerator + denominator / 2) / denominator);
+        int32_t correctedPrim = prim + correction;
+        int32_t correctedEnv = env + correction;
+
+        correctedPrim = correctedPrim < 0 ? 0 : (correctedPrim > 255 ? 255 : correctedPrim);
+        correctedEnv = correctedEnv < 0 ? 0 : (correctedEnv > 255 ? 255 : correctedEnv);
+        ((uint8_t*)primColor)[channel] = correctedPrim;
+        ((uint8_t*)envColor)[channel] = correctedEnv;
+    }
+
+    gfx_intensity_tint_cache_store(GFX_INTENSITY_TINT_CACHE_TWO, 0, width, height, primColor, envColor);
+
+    return true;
+}
+
 static bool gfx_flame_atlas_material_is_supported(void) {
     const TextureTileState* texture0 = gfx_get_texture_tile(0);
     const TextureTileState* texture1 = gfx_get_texture_tile(1);
@@ -2753,6 +3064,22 @@ static void gfx_prepare_tri_pipeline_state(void) {
 
     struct ColorCombiner *comb = rendering_state.color_combiner;
     struct ShaderProgram *prg = comb->prg;
+    struct RGBA textureTintPrimColor = rdp.prim_color;
+    struct RGBA textureTintEnvColor = rdp.env_color;
+    bool textureTintUsesPrimLod = false;
+    bool textureTintUncompensatedAlpha = false;
+#if defined(TARGET_PSP)
+    if (rdp.combine_texture_tint_uses_prim_lod) {
+        if (rdp.combine_two_texture_blend &&
+            gfx_get_two_texture_prim_lod_tint_colors(&textureTintPrimColor, &textureTintEnvColor)) {
+            textureTintUsesPrimLod = true;
+            textureTintUncompensatedAlpha = true;
+        } else if (!rdp.combine_two_texture_blend) {
+            textureTintUsesPrimLod =
+                gfx_get_single_texture_prim_lod_tint_colors(&textureTintPrimColor, &textureTintEnvColor);
+        }
+    }
+#endif
     if (backend_state_dirty || prg != rendering_state.shader_program) {
         gfx_flush();
         gfx_rapi->unload_shader(backend_state_dirty ? NULL : rendering_state.shader_program);
@@ -2766,15 +3093,15 @@ static void gfx_prepare_tri_pipeline_state(void) {
     }
     if (comb->texture_blend &&
         (backend_state_dirty || !rendering_state.texture_env_color_valid ||
-         (rendering_state.texture_env_color.r != rdp.prim_color.r) ||
-         (rendering_state.texture_env_color.g != rdp.prim_color.g) ||
-         (rendering_state.texture_env_color.b != rdp.prim_color.b))) {
+         (rendering_state.texture_env_color.r != textureTintPrimColor.r) ||
+         (rendering_state.texture_env_color.g != textureTintPrimColor.g) ||
+         (rendering_state.texture_env_color.b != textureTintPrimColor.b))) {
         gfx_flush();
         /* GU_TFX_BLEND uses only the texture-environment RGB. Flame opacity is already emitted per vertex, so
          * changing primitive alpha (as every Poe trail element does) must not split the triangle batch. */
-        gfx_rapi->set_texture_env_color(rdp.prim_color.r, rdp.prim_color.g, rdp.prim_color.b,
+        gfx_rapi->set_texture_env_color(textureTintPrimColor.r, textureTintPrimColor.g, textureTintPrimColor.b,
                                         0xFF);
-        rendering_state.texture_env_color = rdp.prim_color;
+        rendering_state.texture_env_color = textureTintPrimColor;
         rendering_state.texture_env_color.a = 0xFF;
         rendering_state.texture_env_color_valid = true;
     }
@@ -2854,6 +3181,9 @@ static void gfx_prepare_tri_pipeline_state(void) {
     state->two_texture_blend_uses_prim_lod = rdp.combine_two_texture_blend_uses_prim_lod;
     state->two_texture_alpha_blend = rdp.combine_two_texture_alpha_blend;
     state->flame_texture_atlas = flame_texture_atlas;
+    state->texture_tint_uses_prim_lod = textureTintUsesPrimLod;
+    state->texture_tint_uncompensated_alpha = textureTintUncompensatedAlpha;
+    state->texture_tint_env_color = textureTintEnvColor;
     state->color_mul_env = rdp.combine_color_mul_env;
     state->color_mul_prim = rdp.combine_color_mul_prim;
     state->alpha_mul_env = rdp.combine_alpha_mul_env;
@@ -3663,6 +3993,11 @@ static void gfx_sp_triangles(uint32_t packed0, uint32_t packed1, uint8_t triangl
         }
         
         out->color = gfx_get_vertex_rgba(comb, use_alpha, &vertex->color, vertex->w, true);
+        if (state->texture_tint_uses_prim_lod) {
+            out->color.r = state->texture_tint_env_color.r;
+            out->color.g = state->texture_tint_env_color.g;
+            out->color.b = state->texture_tint_env_color.b;
+        }
         if (state->color_mul_env) {
             gfx_color_mul_env(&out->color);
         }
@@ -3683,7 +4018,8 @@ static void gfx_sp_triangles(uint32_t packed0, uint32_t packed1, uint8_t triangl
                                          : rdp.env_color.a;
 
             gfx_two_texture_blend_pass_alphas(out->color.a, mixAlpha, state->two_texture_alpha_blend,
-                                              &baseAlpha, &overlayAlpha);
+                                              state->texture_tint_uncompensated_alpha, &baseAlpha,
+                                              &overlayAlpha);
             out->color.a = baseAlpha;
             buf_vbo_tex1[buf_num_vert].alpha = overlayAlpha;
         }
@@ -3700,7 +4036,8 @@ static void gfx_sp_triangles(uint32_t packed0, uint32_t packed1, uint8_t triangl
                                              : rdp.env_color.a;
 
                 gfx_two_texture_blend_pass_alphas(fogOut->color.a, mixAlpha, true,
-                                                  &baseAlpha, &overlayAlpha);
+                                                  state->texture_tint_uncompensated_alpha, &baseAlpha,
+                                                  &overlayAlpha);
                 fogOut->color.a = baseAlpha;
                 buf_vbo_fog_tex1_alpha[buf_num_vert] = overlayAlpha;
             }
@@ -3791,6 +4128,11 @@ static void gfx_sp_tri1_2d(uint8_t vtx1_idx, uint8_t vtx2_idx, UNUSED uint8_t vt
         }
         */
         tri_buf[tri_num_vert].color = gfx_get_vertex_rgba(comb, use_alpha, &v_arr[i]->color, 0.0f, false);
+        if (state->texture_tint_uses_prim_lod) {
+            tri_buf[tri_num_vert].color.r = state->texture_tint_env_color.r;
+            tri_buf[tri_num_vert].color.g = state->texture_tint_env_color.g;
+            tri_buf[tri_num_vert].color.b = state->texture_tint_env_color.b;
+        }
         if (state->color_mul_env) {
             gfx_color_mul_env(&tri_buf[tri_num_vert].color);
         }
@@ -4381,6 +4723,30 @@ static bool gfx_cc_is_combined_mul_primitive(uint32_t a, uint32_t b, uint32_t c,
            (d == G_ACMUX_0);
 }
 
+static bool gfx_cc_is_two_texture_prim_lod_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
+                                                uint32_t rgbD0, uint32_t alphaA0, uint32_t alphaB0,
+                                                uint32_t alphaC0, uint32_t alphaD0, uint32_t rgbA1,
+                                                uint32_t rgbB1, uint32_t rgbC1, uint32_t rgbD1,
+                                                uint32_t alphaA1, uint32_t alphaB1, uint32_t alphaC1,
+                                                uint32_t alphaD1) {
+    return (rgbA0 == G_CCMUX_TEXEL1) && (rgbB0 == G_CCMUX_PRIMITIVE) &&
+           (rgbC0 == G_CCMUX_PRIM_LOD_FRAC) && (rgbD0 == G_CCMUX_TEXEL0) &&
+           (alphaA0 == G_ACMUX_TEXEL1) && (alphaB0 == G_ACMUX_TEXEL0) &&
+           (alphaC0 == G_ACMUX_PRIM_LOD_FRAC) && (alphaD0 == G_ACMUX_TEXEL0) &&
+           (rgbA1 == G_CCMUX_PRIMITIVE) && (rgbB1 == G_CCMUX_ENVIRONMENT) &&
+           (rgbC1 == G_CCMUX_COMBINED) && (rgbD1 == G_CCMUX_ENVIRONMENT) &&
+           gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1);
+}
+
+static bool gfx_cc_is_single_texture_prim_lod_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
+                                                   uint32_t rgbD0, uint32_t rgbA1, uint32_t rgbB1,
+                                                   uint32_t rgbC1, uint32_t rgbD1) {
+    return (rgbA0 == G_CCMUX_TEXEL0) && (rgbB0 == G_CCMUX_PRIMITIVE) &&
+           (rgbC0 == G_CCMUX_PRIM_LOD_FRAC) && (rgbD0 == G_CCMUX_TEXEL0) &&
+           (rgbA1 == G_CCMUX_PRIMITIVE) && (rgbB1 == G_CCMUX_ENVIRONMENT) &&
+           (rgbC1 == G_CCMUX_COMBINED) && (rgbD1 == G_CCMUX_ENVIRONMENT);
+}
+
 static bool gfx_cc_is_combined_mul_environment(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
     return (a == G_ACMUX_COMBINED) && (b == G_ACMUX_0) && (c == G_ACMUX_ENVIRONMENT) &&
            (d == G_ACMUX_0);
@@ -4389,7 +4755,8 @@ static bool gfx_cc_is_combined_mul_environment(uint32_t a, uint32_t b, uint32_t 
 static void gfx_dp_set_combine_mode(uint32_t rgb, uint32_t alpha, bool color_mul_env, bool color_mul_prim,
                                     bool texture_blend, bool texture_blend_shade, bool two_texture_blend,
                                     bool two_texture_blend_uses_prim_lod, bool two_texture_alpha_blend,
-                                    bool alpha_mul_env, bool flame_texture_atlas) {
+                                    bool alpha_mul_env, bool flame_texture_atlas,
+                                    bool texture_tint_uses_prim_lod) {
     uint32_t combineMode = rgb | (alpha << 12);
 
     if (texture_blend) {
@@ -4401,7 +4768,8 @@ static void gfx_dp_set_combine_mode(uint32_t rgb, uint32_t alpha, bool color_mul
         (rdp.combine_two_texture_blend_uses_prim_lod == two_texture_blend_uses_prim_lod) &&
         (rdp.combine_two_texture_alpha_blend == two_texture_alpha_blend) &&
         (rdp.combine_alpha_mul_env == alpha_mul_env) &&
-        (rdp.combine_flame_texture_atlas == flame_texture_atlas)) {
+        (rdp.combine_flame_texture_atlas == flame_texture_atlas) &&
+        (rdp.combine_texture_tint_uses_prim_lod == texture_tint_uses_prim_lod)) {
         return;
     }
     rdp.combine_mode = combineMode;
@@ -4412,6 +4780,7 @@ static void gfx_dp_set_combine_mode(uint32_t rgb, uint32_t alpha, bool color_mul
     rdp.combine_two_texture_alpha_blend = two_texture_alpha_blend;
     rdp.combine_alpha_mul_env = alpha_mul_env;
     rdp.combine_flame_texture_atlas = flame_texture_atlas;
+    rdp.combine_texture_tint_uses_prim_lod = texture_tint_uses_prim_lod;
     gfx_mark_tri_pipeline_dirty();
 }
 
@@ -4450,6 +4819,8 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
     bool twoTextureAlphaBlend = false;
     bool alphaMulEnv = false;
     bool flameTextureAtlas = false;
+    bool textureTintUsesPrimLod = false;
+    bool singleTexturePrimLodTint = false;
     uint32_t rgbComb = color_comb(rgbA0, rgbB0, rgbC0, rgbD0);
     uint32_t alphaComb = color_comb(alphaA0, alphaB0, alphaC0, alphaD0);
 
@@ -4521,6 +4892,23 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
         textureBlend = true;
     }
 
+    textureTintUsesPrimLod =
+        gfx_cc_is_two_texture_prim_lod_tint(rgbA0, rgbB0, rgbC0, rgbD0, alphaA0, alphaB0, alphaC0,
+                                            alphaD0, rgbA1, rgbB1, rgbC1, rgbD1, alphaA1, alphaB1,
+                                            alphaC1, alphaD1);
+
+    if (textureTintUsesPrimLod) {
+        /* Both intensity maps contribute RGB and alpha. Weight each directly by PRIM_LOD_FRAC; the generic
+         * two-pass compensation assumes an opaque TEXEL0 and makes translucent intensity pairs too bright. */
+        twoTextureBlend = true;
+        twoTextureBlendUsesPrimLod = true;
+        twoTextureAlphaBlend = true;
+    }
+
+    singleTexturePrimLodTint =
+        gfx_cc_is_single_texture_prim_lod_tint(rgbA0, rgbB0, rgbC0, rgbD0, rgbA1, rgbB1, rgbC1,
+                                               rgbD1);
+
     flameTextureAtlas =
         ((rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE) &&
         (rgbA0 == G_CCMUX_TEXEL1) && (rgbB0 == G_CCMUX_PRIMITIVE) &&
@@ -4541,15 +4929,23 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
 
     gfx_dp_set_combine_mode(rgbComb, alphaComb, colorMulEnv, colorMulPrim, textureBlend, textureBlendShade,
                             twoTextureBlend, twoTextureBlendUsesPrimLod, twoTextureAlphaBlend, alphaMulEnv,
-                            flameTextureAtlas);
+                            flameTextureAtlas, textureTintUsesPrimLod || singleTexturePrimLodTint);
 #undef COMB_FIELD
 }
 
 static void gfx_dp_set_env_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    if ((rdp.env_color.r == r) && (rdp.env_color.g == g) && (rdp.env_color.b == b) &&
+        (rdp.env_color.a == a)) {
+        return;
+    }
+
     rdp.env_color.r = r;
     rdp.env_color.g = g;
     rdp.env_color.b = b;
     rdp.env_color.a = a;
+    if (rdp.combine_texture_tint_uses_prim_lod) {
+        gfx_mark_tri_pipeline_dirty();
+    }
 }
 
 static void gfx_dp_set_prim_color(uint8_t lod_frac, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
@@ -4691,6 +5087,7 @@ static void gfx_dp_texture_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
     bool saved_combine_two_texture_alpha_blend = rdp.combine_two_texture_alpha_blend;
     bool saved_combine_alpha_mul_env = rdp.combine_alpha_mul_env;
     bool saved_combine_flame_texture_atlas = rdp.combine_flame_texture_atlas;
+    bool saved_combine_texture_tint_uses_prim_lod = rdp.combine_texture_tint_uses_prim_lod;
     if ((rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_COPY) {
         // Per RDP Command Summary Set Tile's shift s and this dsdx should be set to 4 texels
         // Divide by 4 to get 1 instead
@@ -4698,7 +5095,7 @@ static void gfx_dp_texture_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
         
         // Color combiner is turned off in copy mode
         gfx_dp_set_combine_mode(color_comb(0, 0, 0, G_CCMUX_TEXEL0), color_comb(0, 0, 0, G_ACMUX_TEXEL0),
-                                false, false, false, false, false, false, false, false, false);
+                                false, false, false, false, false, false, false, false, false, false);
         
         // Per documentation one extra pixel is added in this modes to each edge
         lrx += 1 << 2;
@@ -4748,6 +5145,7 @@ static void gfx_dp_texture_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
     rdp.combine_two_texture_alpha_blend = saved_combine_two_texture_alpha_blend;
     rdp.combine_alpha_mul_env = saved_combine_alpha_mul_env;
     rdp.combine_flame_texture_atlas = saved_combine_flame_texture_atlas;
+    rdp.combine_texture_tint_uses_prim_lod = saved_combine_texture_tint_uses_prim_lod;
     gfx_mark_tri_pipeline_dirty();
 }
 
@@ -4778,9 +5176,10 @@ static void gfx_dp_fill_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t
     bool saved_combine_two_texture_alpha_blend = rdp.combine_two_texture_alpha_blend;
     bool saved_combine_alpha_mul_env = rdp.combine_alpha_mul_env;
     bool saved_combine_flame_texture_atlas = rdp.combine_flame_texture_atlas;
+    bool saved_combine_texture_tint_uses_prim_lod = rdp.combine_texture_tint_uses_prim_lod;
     if (use_fill_color) {
         gfx_dp_set_combine_mode(color_comb(0, 0, 0, G_CCMUX_SHADE), color_comb(0, 0, 0, G_ACMUX_SHADE), false, false,
-                                false, false, false, false, false, false, false);
+                                false, false, false, false, false, false, false, false);
     }
     gfx_draw_rectangle(ulx, uly, lrx, lry, gfx_rectangle_covers_screen(ulx, uly, lrx, lry),
                        gfx_rectangle_covers_width(ulx, lrx));
@@ -4793,6 +5192,7 @@ static void gfx_dp_fill_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t
         rdp.combine_two_texture_alpha_blend = saved_combine_two_texture_alpha_blend;
         rdp.combine_alpha_mul_env = saved_combine_alpha_mul_env;
         rdp.combine_flame_texture_atlas = saved_combine_flame_texture_atlas;
+        rdp.combine_texture_tint_uses_prim_lod = saved_combine_texture_tint_uses_prim_lod;
         gfx_mark_tri_pipeline_dirty();
     }
 }
@@ -5283,6 +5683,7 @@ static GFX_DL_HANDLER void gfx_sp_s2dex_bg_rect(uint32_t opcode, const void* bgA
     bool savedTwoTextureAlphaBlend;
     bool savedAlphaMulEnv;
     bool savedFlameTextureAtlas;
+    bool savedTextureTintUsesPrimLod;
     const bool scaled = opcode == G_BG_1CYC;
 
     if (!gfx_normalize_read_source(bgAddr, sizeof(uObjBg), "s2dex-bg", &normalizedBg)) {
@@ -5330,9 +5731,10 @@ static GFX_DL_HANDLER void gfx_sp_s2dex_bg_rect(uint32_t opcode, const void* bgA
     savedTwoTextureAlphaBlend = rdp.combine_two_texture_alpha_blend;
     savedAlphaMulEnv = rdp.combine_alpha_mul_env;
     savedFlameTextureAtlas = rdp.combine_flame_texture_atlas;
+    savedTextureTintUsesPrimLod = rdp.combine_texture_tint_uses_prim_lod;
     if ((rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_COPY) {
         gfx_dp_set_combine_mode(color_comb(0, 0, 0, G_CCMUX_TEXEL0), color_comb(0, 0, 0, G_ACMUX_TEXEL0), false,
-                                false, false, false, false, false, false, false, false);
+                                false, false, false, false, false, false, false, false, false);
     }
 
     gfx_draw_rectangle(frameX, frameY, frameX + frameW, frameY + frameH, false, false);
@@ -5345,6 +5747,7 @@ static GFX_DL_HANDLER void gfx_sp_s2dex_bg_rect(uint32_t opcode, const void* bgA
     rdp.combine_two_texture_alpha_blend = savedTwoTextureAlphaBlend;
     rdp.combine_alpha_mul_env = savedAlphaMulEnv;
     rdp.combine_flame_texture_atlas = savedFlameTextureAtlas;
+    rdp.combine_texture_tint_uses_prim_lod = savedTextureTintUsesPrimLod;
     gfx_mark_tri_pipeline_dirty();
 }
 #endif
