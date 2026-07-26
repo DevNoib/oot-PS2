@@ -1452,6 +1452,9 @@ void AudioHeap_UnapplySampleCache(SampleCacheEntry* entry, Sample* sample) {
         if (sample->sampleAddr == entry->allocatedAddr) {
             sample->sampleAddr = entry->sampleAddr;
             sample->medium = entry->origMedium;
+#if defined(TARGET_PSP)
+            OotPspAudioSynth_PublishMeAssetRange(sample, sizeof(*sample));
+#endif
         }
     }
 }
@@ -1539,6 +1542,9 @@ void AudioHeap_ChangeStorage(StorageChange* change, Sample* sample) {
         if (((u32)sample->sampleAddr >= startAddr) && ((u32)sample->sampleAddr < endAddr)) {
             sample->sampleAddr += -startAddr + change->newAddr;
             sample->medium = change->newMedium;
+#if defined(TARGET_PSP)
+            OotPspAudioSynth_PublishMeAssetRange(sample, sizeof(*sample));
+#endif
         }
     }
 }

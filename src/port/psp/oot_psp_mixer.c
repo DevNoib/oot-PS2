@@ -129,35 +129,53 @@ static OotPspMixerState sCpuMixer __attribute__((aligned(64)));
  * the Media Engine, so it does not consume Allegrex CPU time.
  */
 static OotPspMixerMeStorage sMeScalarStorage __attribute__((aligned(64)));
-static OotPspMixerMeStorage* sMeStorage;
-static OotPspMixerState* sCurrentMixer = &sCpuMixer;
-static s32 sExecutingOnMe;
+
+typedef struct {
+    OotPspMixerState* currentMixer;
+    s32 executingOnMe;
+    u8 cacheLinePadding[56];
+} OotPspMixerExecutionState;
+
+typedef struct {
+    OotPspMixerMeStorage* meStorage;
+    volatile s32 mixerVmeReady;
+    u8 cacheLinePadding[56];
+} OotPspMixerMeState;
+
+typedef struct {
+    volatile u32 mixerVmeRuns;
+    volatile u32 mixerVmeFallbacks;
+    volatile u32 mixerEnvVmeRuns;
+    volatile u32 mixerEnvVmeFallbacks;
+    volatile u32 mixerMixVerifyMismatches;
+    volatile u32 mixerEnvVerifyMismatches;
+    volatile u32 mixerResampleVerifyMismatches;
+    u8 cacheLinePadding[36];
+} OotPspMixerCounters;
+
+typedef char OotPspMixerExecutionStateMustFillCacheLine[
+    sizeof(OotPspMixerExecutionState) == 64 ? 1 : -1];
+typedef char OotPspMixerMeStateMustFillCacheLine[
+    sizeof(OotPspMixerMeState) == 64 ? 1 : -1];
+typedef char OotPspMixerCountersMustFillCacheLine[
+    sizeof(OotPspMixerCounters) == 64 ? 1 : -1];
+
+/* ME stores may evict complete dirty cache lines. Keep those lines entirely
+ * mixer-owned, and keep CPU execution selection separate from ME pointers. */
+static OotPspMixerExecutionState sMixerExecutionState __attribute__((aligned(64))) = {
+    .currentMixer = &sCpuMixer,
+};
+static OotPspMixerMeState sMixerMeState __attribute__((aligned(64)));
+static OotPspMixerCounters sMixerCounters __attribute__((aligned(64)));
 
 static OotPspMixerState* OotPspMixer_GetState(void) {
-    return sCurrentMixer;
+    return sMixerExecutionState.currentMixer;
 }
 
 #define OOT_PSP_MIXER_STATE() OotPspMixerState* mixer = OotPspMixer_GetState()
 #define sMixer (*mixer)
 #define DMEM_U8(addr) (&sMixer.dmem.u8[(u16)(addr)])
 #define DMEM_S16(addr) (&sMixer.dmem.s16[(u16)(addr) / sizeof(s16)])
-
-#if defined(TARGET_PSP) && OOT_PSP_AUDIO_MIXER_VME
-static volatile s32 sMixerVmeReady;
-static volatile u32 sMixerVmeRuns;
-static volatile u32 sMixerVmeFallbacks;
-static volatile u32 sMixerEnvVmeRuns;
-static volatile u32 sMixerEnvVmeFallbacks;
-#endif
-
-#if (OOT_PSP_AUDIO_MIXER_FAST || OOT_PSP_AUDIO_MIXER_VME) && OOT_PSP_AUDIO_MIXER_VERIFY
-static volatile u32 sMixerMixVerifyMismatches;
-static volatile u32 sMixerEnvVerifyMismatches;
-#endif
-
-#if OOT_PSP_AUDIO_MIXER_VERIFY
-static volatile u32 sMixerResampleVerifyMismatches;
-#endif
 
 static s16 sResampleTable[64][4] = {
     { 0x0C39, 0x66AD, 0x0D46, 0xFFDF }, { 0x0B39, 0x6696, 0x0E5F, 0xFFD8 },
@@ -274,8 +292,8 @@ void OotPspMixer_InitVme(void) {
         storage->mixer.sampleCache = &storage->sampleCache;
         storage->mixer.bookCache = &storage->bookCache;
         storage->mixer.reverbCache = &storage->reverbCache;
-        sMeStorage = storage;
-        sMixerVmeReady = 0;
+        sMixerMeState.meStorage = storage;
+        sMixerMeState.mixerVmeReady = 0;
         meLibSync();
     }
 #endif
@@ -284,9 +302,9 @@ void OotPspMixer_InitVme(void) {
 void OotPspMixer_ShutdownVme(void) {
 #if defined(TARGET_PSP) && OOT_PSP_AUDIO_MIXER_VME
     if (meLibGetCpuId() == 1) {
-        sMixerVmeReady = 0;
+        sMixerMeState.mixerVmeReady = 0;
         meLibSync();
-        sMeStorage = NULL;
+        sMixerMeState.meStorage = NULL;
     }
 #endif
 }
@@ -926,7 +944,7 @@ void OotPspMixer_Resample(u8 flags, u16 pitch, RESAMPLE_STATE state) {
                 s16 reference = OotPspMixer_ResampleSampleReference(in, tbl);
 
                 if (sample != reference) {
-                    sMixerResampleVerifyMismatches++;
+                    sMixerCounters.mixerResampleVerifyMismatches++;
                     sample = reference;
                 }
             }
@@ -1046,7 +1064,7 @@ static s16 OotPspMixer_MixSampleFastVerified(s16 in, s16 out, s16 gain) {
     s16 reference = OotPspMixer_MixSampleReference(in, out, gain);
 
     if (mixed != reference) {
-        sMixerMixVerifyMismatches++;
+        sMixerCounters.mixerMixVerifyMismatches++;
         return reference;
     }
 
@@ -1056,7 +1074,7 @@ static s16 OotPspMixer_MixSampleFastVerified(s16 in, s16 out, s16 gain) {
 
 #if defined(TARGET_PSP) && OOT_PSP_AUDIO_MIXER_VME
 static s32 OotPspMixer_IsVmeAvailable(void) {
-    return sMixerVmeReady && sExecutingOnMe;
+    return sMixerMeState.mixerVmeReady && sMixerExecutionState.executingOnMe;
 }
 
 static volatile s32* OotPspMixer_VmeTopLane(s32 lane) {
@@ -1139,7 +1157,7 @@ static s32 OotPspMixer_MixVme(s16* in, s16* out, s16 gain, s32 samples) {
     s32 i;
 
     if (!OotPspMixer_IsVmeAvailable() || (samples <= 0) || (samples > OOT_PSP_MIXER_VME_MAX_SAMPLES)) {
-        sMixerVmeFallbacks++;
+        sMixerCounters.mixerVmeFallbacks++;
         return 0;
     }
 
@@ -1184,7 +1202,7 @@ static s32 OotPspMixer_MixVme(s16* in, s16* out, s16 gain, s32 samples) {
         s16 reference = OotPspMixer_MixSampleReference(in[i], oldOut, gain);
 
         if (mixed != reference) {
-            sMixerMixVerifyMismatches++;
+            sMixerCounters.mixerMixVerifyMismatches++;
             mixed = reference;
         }
 #endif
@@ -1192,7 +1210,7 @@ static s32 OotPspMixer_MixVme(s16* in, s16* out, s16 gain, s32 samples) {
         out[i] = mixed;
     }
 
-    sMixerVmeRuns++;
+    sMixerCounters.mixerVmeRuns++;
     return 1;
 }
 #endif
@@ -1306,7 +1324,7 @@ static s32 OotPspMixer_EnvMixerVme(u16 dmemSrc, s32 aiBufLen, s32 swapLR, s32 x0
     s32 i;
 
     if (!OotPspMixer_IsVmeAvailable()) {
-        sMixerEnvVmeFallbacks++;
+        sMixerCounters.mixerEnvVmeFallbacks++;
         return 0;
     }
 
@@ -1378,7 +1396,7 @@ static s32 OotPspMixer_EnvMixerVme(u16 dmemSrc, s32 aiBufLen, s32 swapLR, s32 x0
                                          wetLeftMask, wetRightMask, applyMasks, &refLeft, &refRight, &refWetL,
                                          &refWetR);
             if ((left[i] != refLeft) || (right[i] != refRight) || (wetL[i] != refWetL) || (wetR[i] != refWetR)) {
-                sMixerEnvVerifyMismatches++;
+                sMixerCounters.mixerEnvVerifyMismatches++;
                 left[i] = refLeft;
                 right[i] = refRight;
                 wetL[i] = refWetL;
@@ -1414,7 +1432,7 @@ static s32 OotPspMixer_EnvMixerVme(u16 dmemSrc, s32 aiBufLen, s32 swapLR, s32 x0
         remaining -= OOT_PSP_ENVMIXER_VME_BLOCK_SAMPLES;
     }
 
-    sMixerEnvVmeRuns++;
+    sMixerCounters.mixerEnvVmeRuns++;
     return 1;
 }
 #endif
@@ -1984,15 +2002,17 @@ static void OotPspMixer_ExecuteCommandListInternal(const Acmd* cmdList, s32 cmdC
 }
 
 void OotPspMixer_ExecuteCommandList(const Acmd* cmdList, s32 cmdCount) {
-    sCurrentMixer = &sCpuMixer;
-    sExecutingOnMe = false;
+    sMixerExecutionState.currentMixer = &sCpuMixer;
+    sMixerExecutionState.executingOnMe = false;
     OotPspMixer_ExecuteCommandListInternal(cmdList, cmdCount, NULL);
 }
 
 void OotPspMixer_ExecuteCommandListMe(const Acmd* cmdList, s32 cmdCount,
                                       volatile OotPspMixerOpcodeProfile* profile) {
-    sCurrentMixer = (sMeStorage != NULL) ? &sMeStorage->mixer : &sCpuMixer;
-    sExecutingOnMe = true;
+    sMixerExecutionState.currentMixer = (sMixerMeState.meStorage != NULL) ?
+                                           &sMixerMeState.meStorage->mixer :
+                                           &sCpuMixer;
+    sMixerExecutionState.executingOnMe = true;
     OotPspMixer_ExecuteCommandListInternal(cmdList, cmdCount, profile);
 }
 

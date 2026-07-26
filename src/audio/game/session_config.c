@@ -1,6 +1,12 @@
 #include "audio.h"
 
+#if defined(TARGET_PSP)
+/* ME cache operations are 64-byte granular. Keep their audio-context ranges
+ * from sharing a line with Allegrex-owned globals in neighboring sections. */
+AudioContext gAudioCtx __attribute__((aligned(64)));
+#else
 AudioContext gAudioCtx;
+#endif
 AudioCustomUpdateFunction gAudioCustomUpdateFunction;
 s32 D_801755D8[3]; // unused
 
