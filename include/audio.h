@@ -1063,7 +1063,11 @@ Acmd* AudioSynth_BuildCommandList(Acmd* cmdStart, s32* cmdCnt, s16* aiStart, s32
 #if defined(TARGET_PSP)
 Acmd* AudioSynth_BuildCommandListMe(Acmd* cmdStart, s32* cmdCnt, s16* aiStart, s32 aiBufLen);
 s32 AudioSynth_CanBuildCommandsOnMe(void);
+void OotPspAudioSynth_WritebackMeState(void);
+void OotPspAudioSynth_MeInvalidateState(void);
+void OotPspAudioSynth_MeWritebackState(void);
 void OotPspAudioSynth_InvalidateMeState(void);
+void OotPspAudioSynth_PublishMeAssetRange(const void* address, u32 size);
 #endif
 void AudioHeap_DiscardFont(s32 fontId);
 void AudioHeap_ReleaseNotesForFont(s32 fontId);

@@ -8,6 +8,7 @@
 #include "oot_psp_asset_loader.h"
 #include "oot_psp_audio_backend.h"
 #include "oot_psp_audio_commands.h"
+#include <me-core-mapper/me-lib.h>
 #include <pspkernel.h>
 #endif
 
@@ -55,10 +56,28 @@ u32 sEnvMixerOp = _SHIFTL(A_ENVMIXER, 24, 8);
 #define OOT_PSP_AUDIO_REVERB_DESC_SLOTS 2
 #define OOT_PSP_AUDIO_REVERB_DESC_ITEMS 0
 #define OOT_PSP_AUDIO_REVERB_DESC_ITEMS2 1
+#define OOT_PSP_AUDIO_ME_ASSET_INVALIDATE_MAX 16
+
+typedef struct OotPspAudioMeAssetInvalidateRange {
+    volatile u32 address;
+    volatile u32 size;
+} OotPspAudioMeAssetInvalidateRange;
+
+typedef struct OotPspAudioMeAssetInvalidations {
+    volatile u32 count;
+    u32 reserved;
+    OotPspAudioMeAssetInvalidateRange ranges[OOT_PSP_AUDIO_ME_ASSET_INVALIDATE_MAX];
+    /* Keep range cache maintenance from touching unrelated BSS globals. */
+    u8 cacheLinePadding[56];
+} OotPspAudioMeAssetInvalidations;
+
+typedef char OotPspAudioMeAssetInvalidationsMustFillCacheLines[
+    (sizeof(OotPspAudioMeAssetInvalidations) % 64) == 0 ? 1 : -1];
 
 static u8 sOotPspAudioSynthBadSampleLogged;
 static u8 sOotPspAudioSynthBuildingOnMe;
 static u32 sOotPspAudioMeCacheEpoch = 1;
+static OotPspAudioMeAssetInvalidations sOotPspAudioMeAssetInvalidations __attribute__((aligned(64)));
 static OotPspAudioReverbDownsampleCmd sOotPspAudioReverbDownsampleCmds[OOT_PSP_AUDIO_REVERB_COUNT]
                                                                              [OOT_PSP_AUDIO_REVERB_FRAMES]
                                                                              [OOT_PSP_AUDIO_REVERB_UPDATES]
@@ -135,6 +154,198 @@ static void OotPspAudioSynth_InvalidateRange(const void* address, u32 size) {
     sceKernelDcacheInvalidateRange((void*)start, end - start);
 }
 
+static void OotPspAudioSynth_WritebackRange(const void* address, u32 size) {
+    uintptr_t start;
+    uintptr_t end;
+
+    if ((address == NULL) || (size == 0)) {
+        return;
+    }
+
+    start = (uintptr_t)address & ~63U;
+    end = ((uintptr_t)address + size + 63U) & ~63U;
+    sceKernelDcacheWritebackRange((void*)start, end - start);
+}
+
+static void OotPspAudioSynth_MeInvalidateRange(const void* address, u32 size) {
+    uintptr_t start;
+    uintptr_t end;
+
+    if ((address == NULL) || (size == 0)) {
+        return;
+    }
+
+    start = (uintptr_t)address & ~63U;
+    end = ((uintptr_t)address + size + 63U) & ~63U;
+    meLibDcacheInvalidateRange((u32)start, end - start);
+}
+
+static void OotPspAudioSynth_MeWritebackRange(const void* address, u32 size) {
+    uintptr_t start;
+    uintptr_t end;
+
+    if ((address == NULL) || (size == 0)) {
+        return;
+    }
+
+    start = (uintptr_t)address & ~63U;
+    end = ((uintptr_t)address + size + 63U) & ~63U;
+    meLibDcacheWritebackRange((u32)start, end - start);
+}
+
+static u32 OotPspAudioSynth_NoteSubStateSize(void) {
+    return gAudioCtx.audioBufferParameters.ticksPerUpdate * gAudioCtx.numNotes *
+           sizeof(*gAudioCtx.noteSubsEu);
+}
+
+void OotPspAudioSynth_PublishMeAssetRange(const void* address, u32 size) {
+    u32 start;
+    u32 end;
+    u32 count;
+    u32 i;
+
+    if ((address == NULL) || (size == 0)) {
+        return;
+    }
+
+    start = (u32)(uintptr_t)address & ~63U;
+    end = ((u32)(uintptr_t)address + size + 63U) & ~63U;
+    OotPspAudioSynth_WritebackRange((const void*)(uintptr_t)start, end - start);
+
+    count = sOotPspAudioMeAssetInvalidations.count;
+    if (count > OOT_PSP_AUDIO_ME_ASSET_INVALIDATE_MAX) {
+        count = OOT_PSP_AUDIO_ME_ASSET_INVALIDATE_MAX;
+        sOotPspAudioMeAssetInvalidations.count = count;
+    }
+    for (i = 0; i < count; i++) {
+        u32 rangeStart = sOotPspAudioMeAssetInvalidations.ranges[i].address;
+        u32 rangeEnd = rangeStart + sOotPspAudioMeAssetInvalidations.ranges[i].size;
+
+        if ((start <= rangeEnd) && (end >= rangeStart)) {
+            if (start > rangeStart) {
+                start = rangeStart;
+            }
+            if (end < rangeEnd) {
+                end = rangeEnd;
+            }
+            sOotPspAudioMeAssetInvalidations.ranges[i].address = start;
+            sOotPspAudioMeAssetInvalidations.ranges[i].size = end - start;
+            return;
+        }
+    }
+
+    if (count < OOT_PSP_AUDIO_ME_ASSET_INVALIDATE_MAX) {
+        sOotPspAudioMeAssetInvalidations.ranges[count].address = start;
+        sOotPspAudioMeAssetInvalidations.ranges[count].size = end - start;
+        sOotPspAudioMeAssetInvalidations.count = count + 1;
+    } else {
+        u32 bestIndex = 0;
+        u32 bestExpansion = ~0U;
+
+        /* Asset relocation is rare. If the bounded list fills during bulk
+         * startup, merge with the nearest range instead of flushing the
+         * entire ME cache and disturbing its persistent mixer state. */
+        for (i = 0; i < count; i++) {
+            u32 rangeStart = sOotPspAudioMeAssetInvalidations.ranges[i].address;
+            u32 rangeEnd = rangeStart + sOotPspAudioMeAssetInvalidations.ranges[i].size;
+            u32 mergedStart = (start < rangeStart) ? start : rangeStart;
+            u32 mergedEnd = (end > rangeEnd) ? end : rangeEnd;
+            u32 expansion = (mergedEnd - mergedStart) - (rangeEnd - rangeStart);
+
+            if (expansion < bestExpansion) {
+                bestIndex = i;
+                bestExpansion = expansion;
+            }
+        }
+        {
+            u32 rangeStart = sOotPspAudioMeAssetInvalidations.ranges[bestIndex].address;
+            u32 rangeEnd = rangeStart + sOotPspAudioMeAssetInvalidations.ranges[bestIndex].size;
+
+            if (start > rangeStart) {
+                start = rangeStart;
+            }
+            if (end < rangeEnd) {
+                end = rangeEnd;
+            }
+            sOotPspAudioMeAssetInvalidations.ranges[bestIndex].address = start;
+            sOotPspAudioMeAssetInvalidations.ranges[bestIndex].size = end - start;
+        }
+    }
+}
+
+static void OotPspAudioSynth_MeInvalidatePublishedAssets(void) {
+    u32 count;
+    u32 i;
+
+    OotPspAudioSynth_MeInvalidateRange(&sOotPspAudioMeAssetInvalidations,
+                                       sizeof(sOotPspAudioMeAssetInvalidations));
+    meLibSync();
+    count = sOotPspAudioMeAssetInvalidations.count;
+    if (count > OOT_PSP_AUDIO_ME_ASSET_INVALIDATE_MAX) {
+        count = OOT_PSP_AUDIO_ME_ASSET_INVALIDATE_MAX;
+    }
+    for (i = 0; i < count; i++) {
+        OotPspAudioSynth_MeInvalidateRange(
+            (const void*)(uintptr_t)sOotPspAudioMeAssetInvalidations.ranges[i].address,
+            sOotPspAudioMeAssetInvalidations.ranges[i].size);
+    }
+    meLibSync();
+    sOotPspAudioMeAssetInvalidations.count = 0;
+}
+
+void OotPspAudioSynth_WritebackMeState(void) {
+    OotPspAudioSynth_WritebackRange(
+        &gAudioCtx,
+        (uintptr_t)&gAudioCtx.synthesisReverbs[4] - (uintptr_t)&gAudioCtx);
+    OotPspAudioSynth_WritebackRange(
+        &gAudioCtx.audioBufferParameters,
+        (uintptr_t)&gAudioCtx.soundOutputMode + sizeof(gAudioCtx.soundOutputMode) -
+            (uintptr_t)&gAudioCtx.audioBufferParameters);
+    OotPspAudioSynth_WritebackRange(&gAudioCtx.notes, sizeof(gAudioCtx.notes));
+    OotPspAudioSynth_WritebackRange(gAudioCtx.notes, gAudioCtx.numNotes * sizeof(*gAudioCtx.notes));
+    OotPspAudioSynth_WritebackRange(gAudioCtx.noteSubsEu, OotPspAudioSynth_NoteSubStateSize());
+    OotPspAudioSynth_WritebackRange(&sOotPspAudioMeCacheEpoch, sizeof(sOotPspAudioMeCacheEpoch));
+    OotPspAudioSynth_WritebackRange(&sOotPspAudioMeAssetInvalidations,
+                                    sizeof(sOotPspAudioMeAssetInvalidations));
+}
+
+void OotPspAudioSynth_MeInvalidateState(void) {
+    OotPspAudioSynth_MeInvalidatePublishedAssets();
+    OotPspAudioSynth_MeInvalidateRange(
+        &gAudioCtx,
+        (uintptr_t)&gAudioCtx.synthesisReverbs[4] - (uintptr_t)&gAudioCtx);
+    OotPspAudioSynth_MeInvalidateRange(
+        &gAudioCtx.audioBufferParameters,
+        (uintptr_t)&gAudioCtx.soundOutputMode + sizeof(gAudioCtx.soundOutputMode) -
+            (uintptr_t)&gAudioCtx.audioBufferParameters);
+    OotPspAudioSynth_MeInvalidateRange(&gAudioCtx.notes, sizeof(gAudioCtx.notes));
+    /* The pointers and dimensions used below live in the ranges above. */
+    meLibSync();
+    OotPspAudioSynth_MeInvalidateRange(gAudioCtx.notes,
+                                       gAudioCtx.numNotes * sizeof(*gAudioCtx.notes));
+    OotPspAudioSynth_MeInvalidateRange(gAudioCtx.noteSubsEu, OotPspAudioSynth_NoteSubStateSize());
+    OotPspAudioSynth_MeInvalidateRange(&sOotPspAudioMeCacheEpoch, sizeof(sOotPspAudioMeCacheEpoch));
+}
+
+void OotPspAudioSynth_MeWritebackState(void) {
+    OotPspAudioSynth_MeWritebackRange(
+        &gAudioCtx,
+        (uintptr_t)&gAudioCtx.synthesisReverbs[4] - (uintptr_t)&gAudioCtx);
+    OotPspAudioSynth_MeWritebackRange(
+        &gAudioCtx.audioBufferParameters,
+        (uintptr_t)&gAudioCtx.soundOutputMode + sizeof(gAudioCtx.soundOutputMode) -
+            (uintptr_t)&gAudioCtx.audioBufferParameters);
+    OotPspAudioSynth_MeWritebackRange(&gAudioCtx.notes, sizeof(gAudioCtx.notes));
+    OotPspAudioSynth_MeWritebackRange(gAudioCtx.notes,
+                                      gAudioCtx.numNotes * sizeof(*gAudioCtx.notes));
+    OotPspAudioSynth_MeWritebackRange(gAudioCtx.noteSubsEu, OotPspAudioSynth_NoteSubStateSize());
+    OotPspAudioSynth_MeWritebackRange(&sOotPspAudioMeCacheEpoch, sizeof(sOotPspAudioMeCacheEpoch));
+    OotPspAudioSynth_MeWritebackRange(&sOotPspAudioMeAssetInvalidations,
+                                      sizeof(sOotPspAudioMeAssetInvalidations));
+    OotPspAudioSynth_MeWritebackRange(sOotPspAudioReverbDownsampleCmds,
+                                      sizeof(sOotPspAudioReverbDownsampleCmds));
+}
+
 void OotPspAudioSynth_InvalidateMeState(void) {
     OotPspAudioSynth_InvalidateRange(
         &gAudioCtx.curLoadedBook,
@@ -143,6 +354,8 @@ void OotPspAudioSynth_InvalidateMeState(void) {
     OotPspAudioSynth_InvalidateRange(
         gAudioCtx.noteSubsEu,
         gAudioCtx.audioBufferParameters.ticksPerUpdate * gAudioCtx.numNotes * sizeof(*gAudioCtx.noteSubsEu));
+    OotPspAudioSynth_InvalidateRange(&sOotPspAudioMeAssetInvalidations,
+                                     sizeof(sOotPspAudioMeAssetInvalidations));
     OotPspAudioSynth_InvalidateRange(sOotPspAudioReverbDownsampleCmds,
                                      sizeof(sOotPspAudioReverbDownsampleCmds));
 }

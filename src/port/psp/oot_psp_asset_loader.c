@@ -2227,6 +2227,12 @@ static s32 OotPsp_AssetReadInternal(void* ram, uintptr_t vrom, size_t size, s32 
     }
 
     status = OotPsp_AssetReadLocked(ram, vrom, size, !isAudioRead, !isAudioRead);
+    if (isAudioRead && (status == OOT_PSP_ASSET_READ_OK)) {
+        /* Command construction and mixing can consume audio assets on the ME
+         * immediately after this call. Publish the loaded bytes once here so
+         * the per-frame handoff only needs mutable synthesis-state ranges. */
+        OotPsp_WritebackCacheRange(ram, size);
+    }
     if (!isAudioRead) {
         sOotPspForegroundAssetReadActive--;
     }

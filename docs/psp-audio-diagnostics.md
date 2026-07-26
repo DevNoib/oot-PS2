@@ -54,11 +54,21 @@ is normal after a completed audio-generation job. Progress `256` (`0x100`) means
 but no job checkpoint has replaced it yet.
 
 The second line reports buffer pressure and one-second event counts. `buf=current/target` includes ring data, an
-outstanding ME queue, and frames owned by the audio driver. `ring`, `meq`, and `driver` show those pieces
-separately. `underrun`, `err`, `fallback`, and `timeout` should remain zero. `catchup`, `late`, `io`, and `full`
-explain why generation did not follow its normal 60 Hz cadence. ME wait `avg`, `last`, and `max_all` are in
-microseconds; `max_all` is the worst value since boot. `late` counts producer timer deadlines missed by at least
-1 ms.
+outstanding ME queue, and frames owned by the audio driver. `ready` excludes the outstanding ME queue and is the
+reserve used for urgent scheduling and I/O arbitration. `start` and `recover` are the first-start and
+post-underrun priming thresholds. `ring`, `meq`, and `driver` show the queue pieces separately. `underrun`, `err`,
+`fallback`, and `timeout` should remain zero. `catchup`, `late`, `io`, and `full` explain why generation did not
+follow its normal 60 Hz cadence. ME wait `avg`, `last`, and `max_all` are in microseconds; `max_all` is the worst
+value since boot. `late` counts producer timer deadlines missed by at least 1 ms. The producer temporarily moves
+from priority `32` to priority `31` while `ready` is urgent and returns to `32` after reaching the I/O watermark.
+
+At the default 22.05 kHz source rate, the normal target is six chunks (about 104 ms), first startup requires four
+chunks (about 70 ms), and recovery after an underrun requires two chunks (about 35 ms). I/O backoff begins at five
+playable chunks and urgent scheduling begins below three. I/O backoff retries within the current 60 Hz deadline;
+it no longer discards an entire audio update after a single 1 ms yield. Catch-up is limited to one additional
+update and only occurs after a genuinely missed producer deadline. At or below the urgent watermark, AudioGen
+waits on the ME completion semaphore after submission so completed PCM is published immediately rather than at
+the next 60 Hz update; Allegrex is sleeping during this wait.
 
 The third line breaks a completed audio update into average microseconds:
 
@@ -67,7 +77,7 @@ The third line breaks a completed audio update into average microseconds:
 - `synth` and `seq`: Allegrex sequence/control processing. Command construction is no longer included in normal
   Allegrex phase timing.
 - `cmd`: Allegrex command construction time in the CPU fallback path; it should be zero while the ME is active.
-- `submit`: cache publication and submission of the new ME job.
+- `submit`: bounded synthesis-state cache publication and submission of the new ME job.
 - `abi` and `dma`: average mixer command and sample-DMA counts per update.
 
 An update that needs a nonresident sample DMA is intentionally preflighted onto Allegrex so the ME never enters
@@ -97,7 +107,8 @@ on the next report.
 
 ## Reading a stutter
 
-- An `[audio!] UNDERRUN` with `buf` near zero confirms starvation rather than a bad sample or mixer artifact.
+- An `[audio!] UNDERRUN` with `ready` near zero confirms starvation rather than a bad sample or mixer artifact.
+  A materially larger `buf` at the same event means the missing reserve was still pending on the ME.
 - High `wait_me`, live `wait=1`, and `me=SYNTH/4` point to ME mixer execution as the bottleneck. Progress `2`, `5`,
   or `6` instead isolates command construction, PCM queueing, or state writeback.
 - When `me=SYNTH/4` is slow, use `me-op` total percentage to choose the first function to optimize. Use `avg` to

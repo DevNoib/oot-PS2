@@ -720,6 +720,9 @@ s32 AudioLoad_SyncLoadSample(Sample* sample, s32 fontId) {
             }
             sample->medium = MEDIUM_RAM;
             sample->sampleAddr = sampleAddr;
+#if defined(TARGET_PSP)
+            OotPspAudioSynth_PublishMeAssetRange(sample, sizeof(*sample));
+#endif
         }
     }
     //! @bug Missing return, but the return value is never used so it's fine.
@@ -1877,6 +1880,9 @@ void AudioLoad_FinishSlowLoad(AudioSlowLoad* slowLoad) {
     slowLoad->sample = *sample;
     sample->sampleAddr = slowLoad->ramAddr;
     sample->medium = MEDIUM_RAM;
+#if defined(TARGET_PSP)
+    OotPspAudioSynth_PublishMeAssetRange(sample, sizeof(*sample));
+#endif
 }
 
 /**
@@ -2397,6 +2403,16 @@ void AudioLoad_RelocateFontAndPreloadSamples(s32 fontId, SoundFontData* fontData
         AudioLoad_StartAsyncLoad((u32)sample->sampleAddr, topPreload->ramAddr, sample->size, sample->medium, nChunks,
                                  &gAudioCtx.preloadSampleQueue, topPreload->encodedInfo);
     }
+#if defined(TARGET_PSP)
+    {
+        AudioTable* fontTable = AudioLoad_GetLoadTable(FONT_TABLE);
+        u32 realFontId = AudioLoad_GetRealTableIndex(FONT_TABLE, fontId);
+
+        /* Relocation and endian conversion happen after the asset read. Make
+         * that final pointer graph visible and evict any stale ME copy once. */
+        OotPspAudioSynth_PublishMeAssetRange(fontData, ALIGN16(fontTable->entries[realFontId].size));
+    }
+#endif
 }
 
 /**
@@ -2432,6 +2448,9 @@ s32 AudioLoad_ProcessSamplePreloads(s32 resetStatus) {
                 // Change storage for sample to the preloaded version.
                 sample->sampleAddr = preload->ramAddr;
                 sample->medium = MEDIUM_RAM;
+#if defined(TARGET_PSP)
+                OotPspAudioSynth_PublishMeAssetRange(sample, sizeof(*sample));
+#endif
             }
             preload->isFree = true;
         }
@@ -2655,6 +2674,9 @@ void AudioLoad_PreloadSamplesForFont(s32 fontId, s32 async, SampleBankRelocInfo*
                     sample->sampleAddr = addr;
                     sample->medium = MEDIUM_RAM;
                 }
+#if defined(TARGET_PSP)
+                OotPspAudioSynth_PublishMeAssetRange(sample, sizeof(*sample));
+#endif
                 break;
 
             case true:
