@@ -300,6 +300,7 @@ static struct RDP {
     
     struct RGBA env_color, prim_color, fog_color, fill_color;
     uint8_t prim_lod_frac;
+    uint16_t prim_depth;
     struct XYWidthHeight viewport, scissor;
     bool viewport_or_scissor_changed;
     void *z_buf_address;
@@ -1068,15 +1069,13 @@ static const uint8_t *gfx_prepare_psp_texture_for_upload(const uint8_t *src, uin
     *applied_mirror_s = use_mirror_s;
     *applied_mirror_t = use_mirror_t;
 
-    source_x_offset = use_mirror_s ? pot_width : 0;
-    source_y_offset = use_mirror_t ? pot_height : 0;
+    source_x_offset = 0;
+    source_y_offset = 0;
 
     const size_t src_row_bytes = (size_t)width * bytes_per_pixel;
     const size_t dst_row_bytes = (size_t)(*upload_width) * bytes_per_pixel;
-    const uint32_t content_x_offset = use_mirror_s ? (pot_width - width) : source_x_offset;
-    const uint32_t content_width = width * (use_mirror_s ? 2 : 1);
-    const uint32_t content_y_offset = use_mirror_t ? (pot_height - height) : source_y_offset;
-    const uint32_t content_height = height * (use_mirror_t ? 2 : 1);
+    const uint32_t base_width = pot_width;
+    const uint32_t base_height = pot_height;
 
     for (uint32_t y = 0; y < height; y++) {
         const uint8_t *src_row = src + (size_t)y * src_row_bytes;
@@ -1084,25 +1083,23 @@ static const uint8_t *gfx_prepare_psp_texture_for_upload(const uint8_t *src, uin
         uint8_t *dst_row = dst_base + (size_t)source_x_offset * bytes_per_pixel;
 
         OotPsp_MemcpyVfpu(dst_row, src_row, src_row_bytes);
+        gfx_fill_psp_texture_horizontal_padding(dst_base, 0, width, base_width, bytes_per_pixel);
 
         if (use_mirror_s) {
-            gfx_copy_psp_mirrored_row(dst_base + (size_t)(pot_width - width) * bytes_per_pixel,
-                                      src_row, width, bytes_per_pixel);
+            gfx_copy_psp_mirrored_row(dst_base + (size_t)pot_width * bytes_per_pixel,
+                                      dst_base, pot_width, bytes_per_pixel);
         }
-
-        gfx_fill_psp_texture_horizontal_padding(dst_base, content_x_offset, content_width, *upload_width,
-                                                bytes_per_pixel);
     }
 
+    gfx_fill_psp_texture_vertical_padding(0, height, base_height, dst_row_bytes);
+
     if (use_mirror_t) {
-        for (uint32_t y = 0; y < height; y++) {
-            OotPsp_MemcpyVfpu(psp_texture_stage_buf + (size_t)(pot_height - 1 - y) * dst_row_bytes,
-                              psp_texture_stage_buf + (size_t)(source_y_offset + y) * dst_row_bytes,
+        for (uint32_t y = 0; y < pot_height; y++) {
+            OotPsp_MemcpyVfpu(psp_texture_stage_buf + (size_t)(2 * pot_height - 1 - y) * dst_row_bytes,
+                              psp_texture_stage_buf + (size_t)y * dst_row_bytes,
                               dst_row_bytes);
         }
     }
-
-    gfx_fill_psp_texture_vertical_padding(content_y_offset, content_height, *upload_height, dst_row_bytes);
 
     return psp_texture_stage_buf;
 }
@@ -2880,6 +2877,15 @@ static inline bool gfx_blend_cycle_uses_framebuffer(uint32_t other_mode_l, uint3
     return (m2a == G_BL_CLR_MEM) && ((m2b == G_BL_1MA) || (m2b == G_BL_1));
 }
 
+static inline bool gfx_blend_cycle_preserves_color(uint32_t other_mode_l, uint32_t m1a_shift,
+                                                   uint32_t m1b_shift, uint32_t m2a_shift,
+                                                   uint32_t m2b_shift) {
+    return (((other_mode_l >> m1a_shift) & 3) == G_BL_CLR_BL) &&
+           (((other_mode_l >> m1b_shift) & 3) == G_BL_0) &&
+           (((other_mode_l >> m2a_shift) & 3) == G_BL_CLR_MEM) &&
+           (((other_mode_l >> m2b_shift) & 3) == G_BL_1MA);
+}
+
 static inline float gfx_texture_shift_scale(uint8_t shift) {
     if (shift <= 10) {
         return 1.0f / (float)(1U << shift);
@@ -2936,13 +2942,6 @@ static void gfx_prepare_texture_coord_state(struct TriPipelineState* state, int 
                 state->tex_v_bias[coordSlot] *= v_factor;
             }
 
-            if (texture_node->mirror_s) {
-                state->tex_u_bias[coordSlot] += 0.5f;
-            }
-
-            if (texture_node->mirror_t) {
-                state->tex_v_bias[coordSlot] += 0.5f;
-            }
         }
     }
 #endif
@@ -3050,12 +3049,18 @@ static void gfx_prepare_tri_pipeline_state(void) {
     bool use_fog = (rdp.other_mode_l >> 30) == G_BL_CLR_FOG;
     bool texture_edge = (rdp.other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
     bool use_noise = alpha_compare == G_AC_DITHER;
+    bool alpha_threshold = alpha_compare == G_AC_THRESHOLD;
+    bool depth_only = z_upd && (rdp.other_mode_l & FORCE_BL) &&
+                      gfx_blend_cycle_preserves_color(rdp.other_mode_l, 30, 26, 22, 18) &&
+                      gfx_blend_cycle_preserves_color(rdp.other_mode_l, 28, 24, 20, 16);
     bool use_alpha = alpha_blend || texture_edge || (alpha_compare != G_AC_NONE);
 
     if (use_alpha) cc_id |= SHADER_OPT_ALPHA;
     if (use_fog) cc_id |= SHADER_OPT_FOG;
     if (texture_edge) cc_id |= SHADER_OPT_TEXTURE_EDGE;
     if (use_noise) cc_id |= SHADER_OPT_NOISE;
+    if (alpha_threshold) cc_id |= SHADER_OPT_ALPHA_THRESHOLD;
+    if (depth_only) cc_id |= SHADER_OPT_DEPTH_ONLY;
 
     if (!use_alpha) {
         cc_id &= ~0xfff000;
@@ -4096,7 +4101,11 @@ static void gfx_sp_tri1_2d(uint8_t vtx1_idx, uint8_t vtx2_idx, UNUSED uint8_t vt
     for (int i = 0; i < 2; i++) {
         tri_buf[tri_num_vert].x = v_arr[i]->x;
         tri_buf[tri_num_vert].y = v_arr[i]->y;
-        tri_buf[tri_num_vert].z = 0;
+        /* GU_TRANSFORM_2D uses the depth value verbatim and the PSP backend's
+         * reversed depth buffer maps the N64's near value (0) to 0xffff. */
+        tri_buf[tri_num_vert].z = ((rdp.other_mode_l & G_ZS_PRIM) == G_ZS_PRIM)
+                                      ? (uint16_t)(0xffffU - rdp.prim_depth)
+                                      : 0;
         
         if (use_texture) {
             int32_t u = ((v_arr[i]->u * gfx_texture_shift_scale(tileState->shifts)) - tileState->uls * 8) / 32;
@@ -4106,15 +4115,7 @@ static void gfx_sp_tri1_2d(uint8_t vtx1_idx, uint8_t vtx2_idx, UNUSED uint8_t vt
             const struct TextureHashmapNode *texture_node =
                 active_texture >= 0 ? rendering_state.textures[active_texture] : NULL;
 
-            if (texture_node != NULL) {
-                if (texture_node->mirror_s) {
-                    u += texture_node->upload_width / 2;
-                }
-
-                if (texture_node->mirror_t) {
-                    v += texture_node->upload_height / 2;
-                }
-            }
+            _UNUSED(texture_node);
 #endif
             /*
             if ((rdp.other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT) {
@@ -5086,6 +5087,10 @@ static void gfx_dp_set_fill_color(uint32_t packed_color) {
     rdp.fill_color.a = a * 255;
 }
 
+static void gfx_dp_set_prim_depth(uint16_t z) {
+    rdp.prim_depth = z;
+}
+
 static bool gfx_rectangle_covers_width(int32_t ulx, int32_t lrx) {
     return (ulx <= 0) && (lrx >= ((SCREEN_WIDTH - 1) << 2));
 }
@@ -5157,7 +5162,10 @@ static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lr
     rdp.viewport = default_viewport;
     rdp.scissor = default_viewport;
     rdp.viewport_or_scissor_changed = true;
-    rsp.geometry_mode = 0;
+    /* RDP rectangles do not use RSP geometry flags, but GU only writes the
+     * depth buffer while its depth unit is enabled. Preserve depth processing
+     * for rectangles such as the Lens of Truth mask that request Z_UPD. */
+    rsp.geometry_mode = (rdp.other_mode_l & (Z_CMP | Z_UPD)) ? G_ZBUFFER : 0;
     gfx_mark_tri_pipeline_dirty();
     
     gfx_sp_tri1_2d(0, 1, 2);
@@ -5173,6 +5181,65 @@ static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lr
         gfx_mark_tri_pipeline_dirty();
     }
 }
+
+#if defined(TARGET_PSP)
+typedef struct GfxRectAxisSegment {
+    int32_t screenStart;
+    int32_t screenEnd;
+    int16_t texStart;
+    int16_t texEnd;
+} GfxRectAxisSegment;
+
+static int gfx_split_clamped_mirror_axis(int32_t screenStart, int32_t screenEnd, int16_t texStart,
+                                         int16_t texEnd, uint16_t tileOrigin, uint8_t mask,
+                                         uint8_t shift, uint8_t cm, GfxRectAxisSegment segments[3]) {
+    const bool split = (cm & (G_TX_MIRROR | G_TX_CLAMP)) == (G_TX_MIRROR | G_TX_CLAMP) && mask != G_TX_NOMASK;
+    const float shiftScale = gfx_texture_shift_scale(shift);
+    const float origin = tileOrigin * 8.0f;
+    const float logicalStart = (texStart * shiftScale - origin) / 32.0f;
+    const float logicalEnd = (texEnd * shiftScale - origin) / 32.0f;
+    const float logicalMax = (float)((2U << mask) - 1U);
+    float cuts[4] = { 0.0f, 1.0f };
+    int cutCount = 2;
+
+    if (split && logicalEnd > logicalStart) {
+        const float boundaries[2] = { 0.0f, logicalMax };
+
+        for (int i = 0; i < 2; i++) {
+            const float fraction = (boundaries[i] - logicalStart) / (logicalEnd - logicalStart);
+
+            if (fraction > 0.0f && fraction < 1.0f) {
+                cuts[cutCount++] = fraction;
+            }
+        }
+        for (int i = 1; i < cutCount; i++) {
+            for (int j = i; j > 0 && cuts[j] < cuts[j - 1]; j--) {
+                const float swap = cuts[j];
+                cuts[j] = cuts[j - 1];
+                cuts[j - 1] = swap;
+            }
+        }
+    }
+
+    for (int i = 0; i < cutCount - 1; i++) {
+        const float f0 = cuts[i];
+        const float f1 = cuts[i + 1];
+        float t0 = logicalStart + (logicalEnd - logicalStart) * f0;
+        float t1 = logicalStart + (logicalEnd - logicalStart) * f1;
+
+        if (split) {
+            t0 = t0 < 0.0f ? 0.0f : (t0 > logicalMax ? logicalMax : t0);
+            t1 = t1 < 0.0f ? 0.0f : (t1 > logicalMax ? logicalMax : t1);
+        }
+        segments[i].screenStart = lroundf(screenStart + (screenEnd - screenStart) * f0);
+        segments[i].screenEnd = lroundf(screenStart + (screenEnd - screenStart) * f1);
+        segments[i].texStart = lroundf((origin + t0 * 32.0f) / shiftScale);
+        segments[i].texEnd = lroundf((origin + t1 * 32.0f) / shiftScale);
+    }
+
+    return cutCount - 1;
+}
+#endif
 
 static void gfx_dp_texture_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, uint8_t tile, int16_t uls, int16_t ult, int16_t dsdx, int16_t dtdy, bool flip) {
     _UNUSED(tile);
@@ -5216,10 +5283,6 @@ static void gfx_dp_texture_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
     
     struct VertexColor* ul = &rsp.loaded_vertices_2D[0];
     struct VertexColor* lr = &rsp.loaded_vertices_2D[1];
-    ul->u = uls;
-    ul->v = ult;
-    lr->u = lrs;
-    lr->v = lrt;
     /*@Note: fix this */
     #if 0
     if (!flip) {
@@ -5235,7 +5298,55 @@ static void gfx_dp_texture_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
     }
     #endif
     
-    gfx_draw_rectangle(ulx, uly, lrx, lry, false, false);
+#if defined(TARGET_PSP)
+    if (!flip) {
+        const TextureTileState* tileState = gfx_get_texture_tile(0);
+        GfxRectAxisSegment xSegments[3];
+        GfxRectAxisSegment ySegments[3];
+        const int xCount = gfx_split_clamped_mirror_axis(ulx, lrx, uls, lrs, tileState->uls,
+                                                         tileState->masks, tileState->shifts,
+                                                         tileState->cms, xSegments);
+        const int yCount = gfx_split_clamped_mirror_axis(uly, lry, ult, lrt, tileState->ult,
+                                                         tileState->maskt, tileState->shiftt,
+                                                         tileState->cmt, ySegments);
+        const bool coversScreenWidth = (ulx <= 0) && (lrx >= (SCREEN_WIDTH << 2));
+        const float screenScale = RATIO_Y != 0.0f ? RATIO_Y : 1.0f;
+        const int32_t leftExtension =
+            lroundf(4.0f * (gfx_widescreen_margin_pixels() + gfx_hud_anchor_offset_pixels()) / screenScale);
+        const int32_t rightExtension =
+            lroundf(4.0f * (gfx_widescreen_margin_pixels() - gfx_hud_anchor_offset_pixels()) / screenScale);
+
+        for (int y = 0; y < yCount; y++) {
+            for (int x = 0; x < xCount; x++) {
+                int32_t segmentStart = xSegments[x].screenStart;
+                int32_t segmentEnd = xSegments[x].screenEnd;
+
+                /* The Lens mask clamps to its opaque outer texel. Extend only
+                 * those constant edge segments into the widescreen margins;
+                 * the mirrored circular window remains at its original size. */
+                if (coversScreenWidth && x == 0) {
+                    segmentStart -= leftExtension;
+                }
+                if (coversScreenWidth && x == xCount - 1) {
+                    segmentEnd += rightExtension;
+                }
+                ul->u = xSegments[x].texStart;
+                lr->u = xSegments[x].texEnd;
+                ul->v = ySegments[y].texStart;
+                lr->v = ySegments[y].texEnd;
+                gfx_draw_rectangle(segmentStart, ySegments[y].screenStart,
+                                   segmentEnd, ySegments[y].screenEnd, false, false);
+            }
+        }
+    } else
+#endif
+    {
+        ul->u = uls;
+        ul->v = ult;
+        lr->u = lrs;
+        lr->v = lrt;
+        gfx_draw_rectangle(ulx, uly, lrx, lry, false, false);
+    }
     rdp.combine_mode = saved_combine_mode;
     rdp.combine_color_mul_env = saved_combine_color_mul_env;
     rdp.combine_color_mul_prim = saved_combine_color_mul_prim;
@@ -6098,6 +6209,9 @@ static void gfx_run_dl(Gfx* cmd) {
                 break;
             case G_SETFILLCOLOR:
                 gfx_dp_set_fill_color(cmd->words.w1);
+                break;
+            case G_SETPRIMDEPTH:
+                gfx_dp_set_prim_depth(C1(16, 16));
                 break;
             case G_SETCOMBINE:
                 gfx_dp_set_combine(cmd->words.w0, cmd->words.w1);

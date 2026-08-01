@@ -832,6 +832,10 @@ static void gfx_scegu_apply_shader(struct ShaderProgram *prg) {
         return;
     }
 
+    /* Some RDP passes intentionally update only depth while preserving the
+     * framebuffer color. The Lens of Truth inverted mask relies on this. */
+    sceGuPixelMask((prg->shader_id & SHADER_OPT_DEPTH_ONLY) ? 0xffffffffU : 0);
+
     if (use_texture) {
         sceGuEnable(GU_TEXTURE_2D);
         sceGuTexOffset(0.0f, 0.0f);
@@ -867,6 +871,12 @@ static void gfx_scegu_apply_shader(struct ShaderProgram *prg) {
         // (horrible) alpha discard
         sceGuEnable(GU_ALPHA_TEST);
         sceGuAlphaFunc(GU_GREATER, 0x55, 0xff); /* 0.3f  */
+    } else if (prg->shader_id & SHADER_OPT_ALPHA_THRESHOLD) {
+        /* OoT's threshold display lists use zero-alpha texels as holes. This
+         * is especially important when a textured rectangle writes depth,
+         * as the Lens of Truth mask does. */
+        sceGuEnable(GU_ALPHA_TEST);
+        sceGuAlphaFunc(GU_GREATER, 0, 0xff);
     } else {
         sceGuDisable(GU_ALPHA_TEST);
     }

@@ -38,8 +38,9 @@ COMPILER ?= ido
 #   gc-jp-ce       GameCube Japan (Collector's Edition disc)
 #   ique-cn        iQue Player (Simplified Chinese)
 VERSION ?= gc-eu-mq-dbg
-# Number of threads to extract and compress with.
-N_THREADS ?= $(shell nproc)
+# Number of threads to extract and compress with. `nproc` is not available by
+# default on macOS, while getconf is available on both macOS and Linux.
+N_THREADS ?= $(shell nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 # If DEBUG_OBJECTS is 1, produce additional debugging files such as objdump output or raw binaries for assets
 DEBUG_OBJECTS ?= 0
 # Set prefix to mips binutils binaries (mips-linux-gnu-ld => 'mips-linux-gnu-') - Change at your own risk!
@@ -1187,6 +1188,7 @@ $(BUILD_DIR)/assets/audio/audiobank_padding.o:
 PSP_ENABLE_GPROF ?= 0
 PSP_AUDIO_SOURCE_FREQUENCY ?= 22050
 PSP_AUDIO_HARDWARE_SRC ?= 1
+PSP_AUDIO_MEDIA_ENGINE ?= 1
 PSP_AUDIO_MIXER_VME ?= 1
 PSP_AUDIO_MIXER_FAST ?= 1
 PSP_AUDIO_MIXER_VERIFY ?= 0
@@ -1197,9 +1199,13 @@ PSP_OOTDEBUG ?= 0
 PSP_AUDIO_ME_OPT_CFLAGS ?= -O3 -finline-functions
 PSP_AUDIO_CPU_OPT_CFLAGS ?= -O3 -finline-functions
 PSP_GFX_HOT_OPT_CFLAGS ?= -O3 -finline-functions
+PSP_PORT_AUDIO_ME_VARIANT :=
 PSP_PORT_AUDIO_MIXER_VARIANT :=
 PSP_PORT_AUDIO_SRC_VARIANT :=
 PSP_PORT_AUDIO_DIAGNOSTICS_VARIANT :=
+ifeq ($(PSP_AUDIO_MEDIA_ENGINE),0)
+PSP_PORT_AUDIO_ME_VARIANT := -no-me
+endif
 ifeq ($(PSP_AUDIO_HARDWARE_SRC),0)
 PSP_PORT_AUDIO_SRC_VARIANT := -soft-src
 endif
@@ -1226,9 +1232,9 @@ ifneq ($(PSP_PORT_OOTDEBUG_ENABLED),)
 PSP_PORT_OOTDEBUG_VARIANT := -ootdebug
 endif
 ifneq ($(PSP_PORT_GPROF_ENABLED),)
-PSP_PORT_DEFAULT_BUILD_DIR := build/psp-port-gprof$(PSP_PORT_AUDIO_MIXER_VARIANT)$(PSP_PORT_AUDIO_SRC_VARIANT)$(PSP_PORT_AUDIO_DIAGNOSTICS_VARIANT)$(PSP_PORT_OOTDEBUG_VARIANT)/$(VERSION)
+PSP_PORT_DEFAULT_BUILD_DIR := build/psp-port-gprof$(PSP_PORT_AUDIO_ME_VARIANT)$(PSP_PORT_AUDIO_MIXER_VARIANT)$(PSP_PORT_AUDIO_SRC_VARIANT)$(PSP_PORT_AUDIO_DIAGNOSTICS_VARIANT)$(PSP_PORT_OOTDEBUG_VARIANT)/$(VERSION)
 else
-PSP_PORT_DEFAULT_BUILD_DIR := build/psp-port$(PSP_PORT_AUDIO_MIXER_VARIANT)$(PSP_PORT_AUDIO_SRC_VARIANT)$(PSP_PORT_AUDIO_DIAGNOSTICS_VARIANT)$(PSP_PORT_OOTDEBUG_VARIANT)/$(VERSION)
+PSP_PORT_DEFAULT_BUILD_DIR := build/psp-port$(PSP_PORT_AUDIO_ME_VARIANT)$(PSP_PORT_AUDIO_MIXER_VARIANT)$(PSP_PORT_AUDIO_SRC_VARIANT)$(PSP_PORT_AUDIO_DIAGNOSTICS_VARIANT)$(PSP_PORT_OOTDEBUG_VARIANT)/$(VERSION)
 endif
 PSP_PORT_BUILD_DIR ?= $(PSP_PORT_DEFAULT_BUILD_DIR)
 PSP_PORT_PSPSDK := $(shell psp-config -p 2>/dev/null)
@@ -1576,6 +1582,7 @@ PSP_PORT_DEFINES := \
 	-DTARGET_PSP=1 \
 	-DOOT_PSP_AUDIO_SOURCE_FREQUENCY=$(PSP_AUDIO_SOURCE_FREQUENCY) \
 	-DOOT_PSP_AUDIO_HARDWARE_SRC=$(PSP_AUDIO_HARDWARE_SRC) \
+	-DOOT_PSP_AUDIO_MEDIA_ENGINE=$(PSP_AUDIO_MEDIA_ENGINE) \
 	-DOOT_PSP_AUDIO_MIXER_VME=$(PSP_AUDIO_MIXER_VME) \
 	-DOOT_PSP_AUDIO_MIXER_FAST=$(PSP_AUDIO_MIXER_FAST) \
 	-DOOT_PSP_AUDIO_MIXER_VERIFY=$(PSP_AUDIO_MIXER_VERIFY) \

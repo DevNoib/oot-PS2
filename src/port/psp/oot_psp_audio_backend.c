@@ -23,6 +23,9 @@
 #ifndef OOT_PSP_AUDIO_HARDWARE_SRC
 #define OOT_PSP_AUDIO_HARDWARE_SRC 1
 #endif
+#ifndef OOT_PSP_AUDIO_MEDIA_ENGINE
+#define OOT_PSP_AUDIO_MEDIA_ENGINE 1
+#endif
 #ifndef OOT_PSP_AUDIO_DIAGNOSTICS
 #define OOT_PSP_AUDIO_DIAGNOSTICS 0
 #endif
@@ -255,7 +258,9 @@ static s32 sAudioHardwareSrc;
 
 void AudioThread_InitExternalPool(void* ramAddr, u32 size);
 static s32 OotPspAudioBackend_EnsureMeLockSema(void);
+#if OOT_PSP_AUDIO_MEDIA_ENGINE
 static s32 OotPspAudioBackend_EnsureMeCompletionInterrupt(void);
+#endif
 static void OotPspAudioBackend_MeWritebackRange(const void* address, u32 size);
 static void OotPspAudioBackend_MeInvalidateInputs(const Acmd* cmdList, s32 cmdCount,
                                                   const void* privateOutput, u32 privateOutputBytes);
@@ -388,6 +393,9 @@ __attribute__((noinline, aligned(4))) void meLibOnProcess(void) {
  * the shared state from BOOTING to IDLE.
  */
 s32 OotPspAudioBackend_BootMe(void) {
+#if !OOT_PSP_AUDIO_MEDIA_ENGINE
+    return 0;
+#else
     if (sAudioMeBootStarted) {
         return sAudioMeBootResult;
     }
@@ -412,9 +420,14 @@ s32 OotPspAudioBackend_BootMe(void) {
     sAudioMeBootStarted = true;
     sAudioMeBootResult = meLibDefaultInit();
     return sAudioMeBootResult;
+#endif
 }
 
 static s32 OotPspAudioBackend_InitMe(void) {
+#if !OOT_PSP_AUDIO_MEDIA_ENGINE
+    /* CPU mixing still uses this semaphore to serialize mixer state. */
+    return OotPspAudioBackend_EnsureMeLockSema();
+#else
     s32 ret;
     u32 readyStart;
 
@@ -456,6 +469,7 @@ static s32 OotPspAudioBackend_InitMe(void) {
 
     sAudioMeInitialized = true;
     return 0;
+#endif
 }
 
 static void OotPspAudioBackend_InvalidateRange(const void* address, u32 size) {
@@ -934,6 +948,7 @@ static s32 OotPspAudioBackend_EnsureMeLockSema(void) {
     return 0;
 }
 
+#if OOT_PSP_AUDIO_MEDIA_ENGINE
 static void OotPspAudioBackend_MeCompletionInterrupt(UNUSED int subIntr, UNUSED void* arg) {
     if (OotPspAudioBackend_IsValidUid(sAudioMeCompletionSema)) {
         sceKernelSignalSema(sAudioMeCompletionSema, 1);
@@ -973,6 +988,7 @@ static s32 OotPspAudioBackend_EnsureMeCompletionInterrupt(void) {
     sAudioMeCompletionInterruptReady = true;
     return 0;
 }
+#endif
 
 static void OotPspAudioBackend_DrainMeCompletion(void) {
     if (!sAudioMeCompletionInterruptReady) {

@@ -32,6 +32,8 @@ enum {
 #define SHADER_OPT_NOISE (1 << 27)
 #define SHADER_OPT_TEXTURE_BLEND (1 << 28)
 #define SHADER_OPT_TEXTURE_BLEND_SHADE (1 << 29)
+#define SHADER_OPT_ALPHA_THRESHOLD (1 << 30)
+#define SHADER_OPT_DEPTH_ONLY (1U << 31)
 
 struct CCFeatures {
     uint8_t c[2][4];
