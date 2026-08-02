@@ -262,6 +262,9 @@ static struct RSP {
 
 static struct RDP {
     const uint8_t *palette;
+#if defined(TARGET_PSP)
+    uint32_t palette_key;
+#endif
     struct {
         const uint8_t *addr;
         uint8_t fmt;
@@ -668,6 +671,30 @@ static bool gfx_normalize_texture_source(const uint8_t** addr, uint32_t sizeByte
     }
 
     return false;
+}
+
+static uint32_t gfx_texture_palette_key(const uint8_t* addr, uint32_t sizeBytes) {
+    uint32_t key = OotPsp_GetExternalAssetRangeSerial(addr, sizeBytes);
+    const uint8_t* bytes = addr;
+
+    if (key != 0) {
+        return key;
+    }
+
+    /* Normal-sky TLUTs combine two independently loaded 128-color assets in
+     * one 256-color buffer, so no single asset serial covers the whole span.
+     * Hash that composite buffer instead of treating its stable address as an
+     * immutable palette. */
+    if (!gfx_normalize_texture_source(&bytes, sizeBytes)) {
+        return 0;
+    }
+
+    key = 2166136261U;
+    for (uint32_t i = 0; i < sizeBytes; i++) {
+        key = (key ^ bytes[i]) * 16777619U;
+    }
+
+    return key != 0 ? key : 1;
 }
 
 static bool gfx_texture_load_slot(const char* context, int* slot) {
@@ -1710,6 +1737,9 @@ extern void texman_clear(void);
 extern void texman_upload(int width, int height, unsigned int type, const void* buffer);
 extern int texman_vram_space_available(unsigned int size);
 extern int texman_texture_slot_available(void);
+#if defined(TARGET_PSP)
+extern void gfx_scegu_sync_texture_cache(void);
+#endif
 
 static uint32_t gfx_texture_import_width(int tile);
 static uint32_t gfx_texture_import_height(int tile);
@@ -1762,6 +1792,11 @@ static unsigned int gfx_texture_cache_upload_size(uint16_t width, uint16_t heigh
 
 static void gfx_texture_cache_clear(void) {
     gfx_flush();
+#if defined(TARGET_PSP)
+    /* gfx_flush only emits the pending draw. The GU may still be sampling the
+     * old texture allocations, so wait before texman_clear recycles their VRAM. */
+    gfx_scegu_sync_texture_cache();
+#endif
     texman_clear();
 #if defined(TARGET_PSP)
     for (uint32_t i = 0; i < ARRAY_COUNTU(sFlameAtlasCache); i++) {
@@ -1796,10 +1831,8 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
                                 (orig_addr != sInvalidPaletteBuf) &&
                                 OotPsp_IsRuntimeByteRange(orig_addr, source_span_size);
     const bool uses_palette = fmt == G_IM_FMT_CI;
-    const uint32_t palette_size = siz == G_IM_SIZ_4b ? GFX_CI4_TLUT_SIZE_BYTES : GFX_TLUT_SIZE_BYTES;
     const uint8_t* palette_addr = uses_palette ? rdp.palette : NULL;
-    const uint32_t palette_key =
-        uses_palette ? OotPsp_GetExternalAssetRangeSerial(palette_addr, palette_size) : 0;
+    const uint32_t palette_key = uses_palette ? rdp.palette_key : 0;
     const uint8_t mirror_s = (tileState->cms & G_TX_MIRROR) != 0 && tileState->masks != G_TX_NOMASK;
     const uint8_t mirror_t = (tileState->cmt & G_TX_MIRROR) != 0 && tileState->maskt != G_TX_NOMASK;
 
@@ -4445,8 +4478,10 @@ static bool gfx_loaded_texture_matches_static_cache(int loadSlot, const uint8_t*
                                                     uint32_t rowStrideBytes, uint8_t sourceNibbleOffset) {
     const struct TextureHashmapNode* node = rendering_state.textures[loadSlot];
     const bool usesPalette = rdp.texture_to_load.fmt == G_IM_FMT_CI;
+    const uint32_t sourceKey = OotPsp_GetExternalAssetRangeSerial(sourceAddr, sourceSizeBytes);
 
-    if (rdp.textures_changed[loadSlot] || (node == NULL) || (node->source_key == 0) ||
+    if (rdp.textures_changed[loadSlot] || (node == NULL) || (sourceKey == 0) ||
+        (node->source_key != sourceKey) ||
         (node->texture_addr != sourceAddr) || (node->fmt != rdp.texture_to_load.fmt) ||
         (node->siz != rdp.texture_to_load.siz) ||
         (rdp.loaded_texture[loadSlot].addr != sourceAddr) ||
@@ -4457,14 +4492,14 @@ static bool gfx_loaded_texture_matches_static_cache(int loadSlot, const uint8_t*
         return false;
     }
 
-    /* Runtime CI palettes can change in place. Only suppress the load when both image and palette came from
-     * immutable external assets and the cached palette is still the one selected by the display list. */
-    return !usesPalette || ((node->palette_key != 0) && (node->palette_addr == rdp.palette));
+    /* CI palettes can change in place. Suppress the load only while the
+     * current serial/content key still matches the converted cache entry. */
+    return !usesPalette || ((node->palette_key != 0) && (node->palette_addr == rdp.palette) &&
+                            (node->palette_key == rdp.palette_key));
 }
 #endif
 
 static void gfx_dp_load_tlut(UNUSED uint8_t tile, uint32_t high_index) {
-    _UNUSED(high_index);
 
 #if defined(TARGET_PSP)
     int loadSlot;
@@ -4478,10 +4513,19 @@ static void gfx_dp_load_tlut(UNUSED uint8_t tile, uint32_t high_index) {
     SUPPORT_CHECK(tile == G_TX_LOADTILE);
     SUPPORT_CHECK(rdp.texture_to_load.siz == G_IM_SIZ_16b);
 #endif
+#if defined(TARGET_PSP)
+    const uint32_t paletteSize = (high_index + 1) * sizeof(uint16_t);
+    const uint32_t paletteKey = gfx_texture_palette_key(rdp.texture_to_load.addr, paletteSize);
+    const bool paletteChanged = (rdp.palette != rdp.texture_to_load.addr) ||
+                                (rdp.palette_key != paletteKey);
+#else
+    _UNUSED(high_index);
     const bool paletteChanged = rdp.palette != rdp.texture_to_load.addr;
+#endif
 
     rdp.palette = rdp.texture_to_load.addr;
 #if defined(TARGET_PSP)
+    rdp.palette_key = paletteKey;
     GFX_CAPTURE_CMD(rdp.loaded_texture[loadSlot].image_cmd, rdp.texture_to_load.image_cmd);
     GFX_CAPTURE_CMD(rdp.loaded_texture[loadSlot].load_cmd, sCurrentCmd);
     if (paletteChanged) {

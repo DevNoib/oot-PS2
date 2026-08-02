@@ -136,6 +136,15 @@ static void gfx_scegu_reserve_list_memory(size_t dataSize) {
     sceGuStart(GU_DIRECT, list);
 }
 
+void gfx_scegu_sync_texture_cache(void) {
+    /* Texture-cache eviction reuses the same VRAM addresses immediately. Make
+     * sure every draw that references the old contents has completed before
+     * the allocator overwrites them, then continue the frame in a fresh list. */
+    sceGuFinish();
+    sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+    sceGuStart(GU_DIRECT, list);
+}
+
 static unsigned int staticOffset = 0;
 unsigned int scegu_fog_color = 0;
 
