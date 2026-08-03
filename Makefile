@@ -1624,14 +1624,14 @@ PSP_PORT_CFLAGS := -G0 -O2 -g3 -Wall -Wextra -Wno-format-security -Wno-unused-pa
 	$(PSP_PORT_DEFINES) $(PSP_PORT_INCLUDES)
 
 ifneq ($(PSP_PORT_GPROF_ENABLED),)
-PSP_PORT_CFLAGS += -pg -g -fno-omit-frame-pointer -fno-optimize-sibling-calls
+PSP_PORT_CFLAGS += -fno-omit-frame-pointer -fno-optimize-sibling-calls -flto
 endif
 PSP_PORT_AUDIO_ME_CFLAGS := $(filter-out -pg,$(PSP_PORT_CFLAGS)) $(PSP_AUDIO_ME_OPT_CFLAGS)
 PSP_PORT_AUDIO_CPU_CFLAGS := $(PSP_PORT_CFLAGS) $(PSP_AUDIO_CPU_OPT_CFLAGS)
 PSP_PORT_GFX_HOT_CFLAGS := $(PSP_PORT_CFLAGS) $(PSP_GFX_HOT_OPT_CFLAGS)
 
 PSP_PORT_LIBS := -L$(PSP_PORT_PSPSDK)/lib -L$(PSP_PORT_PREFIX)/lib -lme-core -lpspdmac -lpspgu -lpspgum -ljpeg -lz \
-	-lpspdisplay -lpspge -lpspfpu -lpspctrl -lpsppower -lpspaudio -lpspdebug
+	-lpspdisplay -lpspge -lpspfpu -lpspctrl -lpsppower -lpspaudio 
 ifneq ($(PSP_PORT_INTRAFONT_LIB),)
 PSP_PORT_LIBS += -lintrafont
 endif
@@ -1640,8 +1640,8 @@ ifneq ($(PSP_PORT_GPROF_ENABLED),)
 PSP_PORT_LINKER_DEPS := $(PSP_PORT_GPROF_LINKER_SCRIPT)
 PSP_PORT_EXTRA_LINK_OBJECTS := $(PSP_PORT_ASSET_SEGMENT_OBJECT)
 PSP_PORT_LDFLAGS := -pg -g -Wl,-T$(PSP_PORT_GPROF_LINKER_SCRIPT) -Wl,-q -Wl,-zmax-page-size=128 -Wl,--gc-sections \
-	-Wl,-u,module_info -Wl,-u,sceKernelChangeThreadPriority -Wl,-u,ootPspMeKcallImport \
-	$(PSP_PORT_LIBS)
+	-Wl,-u,module_info -Wl,-u,sceKernelChangeThreadPriority -Wl,-u,ootPspMeKcallImport, -flto \
+	$(PSP_PORT_LIBS) 
 else
 PSP_PORT_LINKER_DEPS :=
 PSP_PORT_EXTRA_LINK_OBJECTS :=
