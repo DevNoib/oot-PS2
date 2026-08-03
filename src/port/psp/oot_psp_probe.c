@@ -1,5 +1,6 @@
 #include <pspfpu.h>
 #include <pspkernel.h>
+#include <psppower.h>
 #include <pspthreadman.h>
 #include <stdio.h>
 #include <string.h>
@@ -97,11 +98,27 @@ static int OotPspExitCallback(UNUSED int arg1, UNUSED int arg2, UNUSED void* com
     return 0;
 }
 
-static int OotPspCallbackThread(UNUSED SceSize args, UNUSED void* argp) {
-    int callbackId = sceKernelCreateCallback("OOT PSP Exit Callback", OotPspExitCallback, NULL);
+static int OotPspPowerCallback(UNUSED int arg1, int powerInfo, UNUSED void* common) {
+    if (powerInfo & PSP_POWER_CB_RESUMING) {
+        OotPsp_AssetNotifyResume();
+    }
 
-    if (callbackId >= 0) {
-        sceKernelRegisterExitCallback(callbackId);
+    return 0;
+}
+
+static int OotPspCallbackThread(UNUSED SceSize args, UNUSED void* argp) {
+    int exitCallbackId = sceKernelCreateCallback("OOT PSP Exit Callback", OotPspExitCallback, NULL);
+    int powerCallbackId = sceKernelCreateCallback("OOT PSP Power Callback", OotPspPowerCallback, NULL);
+    s32 callbackRegistered = false;
+
+    if (exitCallbackId >= 0) {
+        sceKernelRegisterExitCallback(exitCallbackId);
+        callbackRegistered = true;
+    }
+    if ((powerCallbackId >= 0) && (scePowerRegisterCallback(0, powerCallbackId) >= 0)) {
+        callbackRegistered = true;
+    }
+    if (callbackRegistered) {
         sceKernelSleepThreadCB();
     }
 

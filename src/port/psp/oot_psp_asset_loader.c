@@ -117,7 +117,8 @@ static s32 sOotPspPackedAssetUnavailable = false;
 static size_t sOotPspPackedAssetSize;
 static s32 sOotPspPackedAssetSizeKnown = false;
 static size_t sOotPspPackedAssetPosition;
-static s32 sOotPspPackedAssetPositionKnown = false;
+static volatile s32 sOotPspPackedAssetPositionKnown = false;
+static volatile s32 sOotPspAssetResumePending = false;
 static u8* sOotPspPackedCacheData;
 static size_t sOotPspPackedCacheBlockCount;
 static s32 sOotPspPackedCacheInitTried = false;
@@ -180,6 +181,17 @@ static void OotPsp_LockAssetLoader(void) {
     if (sOotPspAssetSema >= 0) {
         sceKernelWaitSema(sOotPspAssetSema, 1, NULL);
     }
+
+    /* File handles survive normal cache eviction, but their backing device and
+     * seek position cannot be trusted across a PSP suspend. Do this while the
+     * loader is serialized so neither the foreground nor audio reader can use
+     * the stale descriptor. Allocated cache buffers remain intact. */
+    if (sOotPspAssetResumePending) {
+        sOotPspAssetResumePending = false;
+        OotPsp_ClosePackedAssetFile();
+        sOotPspPackedAssetUnavailable = false;
+        printf("oot-psp asset file reset after resume\n");
+    }
 }
 
 static void OotPsp_UnlockAssetLoader(void) {
@@ -188,7 +200,7 @@ static void OotPsp_UnlockAssetLoader(void) {
     }
 }
 
-static void OotPsp_CooperateWithAudioRead(s32 allowAudioYield, s32* currentOffsetKnown) {
+static void OotPsp_CooperateWithAudioRead(s32 allowAudioYield, volatile s32* currentOffsetKnown) {
     if (!allowAudioYield || !OotPspAudioBackend_NeedsRefillDuringIo()) {
         return;
     }
@@ -288,6 +300,14 @@ s32 OotPsp_AssetInit(const char* executablePath) {
     OotPsp_InitAssetSema();
     OotPsp_PreloadPersistentAssets();
     return true;
+}
+
+void OotPsp_AssetNotifyResume(void) {
+    /* This runs from the callback thread. Only publish scalar state here; the
+     * first serialized asset transaction performs sceIoClose/sceIoOpen. Mark
+     * the tracked position unknown immediately in case audio runs first. */
+    sOotPspPackedAssetPositionKnown = false;
+    sOotPspAssetResumePending = true;
 }
 
 static s32 OotPsp_IsAbsolutePath(const char* path) {
