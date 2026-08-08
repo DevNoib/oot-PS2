@@ -16,6 +16,7 @@
 #include "oot_psp_controls.h"
 #include "oot_psp_home_menu.h"
 #include "oot_psp_performance.h"
+#include "oot_psp_renderer.h"
 #include "oot_psp_runtime_patch.h"
 #include "play_state.h"
 #include "player.h"
@@ -146,6 +147,9 @@ int main(int argc, char** argv) {
     size_t nextSize = sizeof(SetupState);
 
     osInitialize();
+    /* gfx_scegu_init preloads the home-menu firmware font. Reserve its
+     * normal-heap buffers before pinned assets and volatile caches are placed. */
+    OotPspRenderer_Init();
     osSyncPrintf("oot-psp probe rom md5=%s size=%u header=%02X%02X%02X%02X\n", gOotPspRomMd5, gOotPspRomSize,
                  gOotPspRomHeader[0], gOotPspRomHeader[1], gOotPspRomHeader[2], gOotPspRomHeader[3]);
     if (!OotPsp_AssetInit(((argc > 0) && (argv != NULL)) ? argv[0] : NULL)) {

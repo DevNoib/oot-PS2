@@ -7,6 +7,9 @@
 #include <pspdmac.h>
 #include <pspiofilemgr.h>
 #include <pspkernel.h>
+#include <psppower.h>
+#include <pspsuspend.h>
+#include <pspsysmem.h>
 #include <pspthreadman.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,7 +27,7 @@
 #define OOT_PSP_PACKED_CACHE_BLOCK_SIZE     0x10000
 #define OOT_PSP_PACKED_DIRECT_READ_MIN_SIZE (4 * OOT_PSP_PACKED_CACHE_BLOCK_SIZE)
 #define OOT_PSP_PACKED_CACHE_TARGET_SIZE    (4 * 1024 * 1024)
-#define OOT_PSP_PACKED_CACHE_MIN_SIZE       (2 * 1024 * 1024)
+#define OOT_PSP_PACKED_CACHE_MIN_SIZE       (1 * 1024 * 1024)
 #define OOT_PSP_PACKED_CACHE_ALLOC_STEP     (1024 * 1024)
 #define OOT_PSP_PACKED_CACHE_MAX_BLOCK_COUNT \
     (OOT_PSP_PACKED_CACHE_TARGET_SIZE / OOT_PSP_PACKED_CACHE_BLOCK_SIZE)
@@ -48,6 +51,7 @@
 #define OOT_PSP_ASSET_DMA_COPY_MIN_SIZE     0x1000
 #define OOT_PSP_ASSET_DMA_COPY_MAX_SIZE     OOT_PSP_PACKED_CACHE_BLOCK_SIZE
 #define OOT_PSP_ASSET_CACHE_LINE_SIZE       64
+#define OOT_PSP_CACHE_ALLOCATION_COUNT          16
 
 typedef struct OotPspLoadedAssetRange {
     uintptr_t ramStart;
@@ -109,6 +113,12 @@ typedef struct OotPspPinnedAssetWindowCache {
     OotPspAssetWindowCache cache;
 } OotPspPinnedAssetWindowCache;
 
+typedef struct OotPspCacheAllocation {
+    void* address;
+    SceUID blockId;
+    size_t size;
+} OotPspCacheAllocation;
+
 static char sOotPspAssetRoot[256];
 static s32 sOotPspOriginalRangesSorted = -1;
 static SceUID sOotPspAssetSema = -1;
@@ -146,6 +156,12 @@ static u32 sOotPspLoadedAssetSerial = 1;
 static u32 sOotPspAssetCacheClock;
 static volatile s32 sOotPspForegroundAssetReadWaiters;
 static volatile s32 sOotPspForegroundAssetReadActive;
+static OotPspCacheAllocation sOotPspCacheAllocations[OOT_PSP_CACHE_ALLOCATION_COUNT];
+static size_t sOotPspVolatileCacheAllocationCount;
+static size_t sOotPspVolatileCacheBytes;
+static size_t sOotPspVolatileMemorySize;
+static s32 sOotPspVolatileMemoryLocked;
+static s32 sOotPspVolatileMemoryFailureReported;
 static OotPspPinnedAssetWindowCache sOotPspPinnedAssetCaches[] = {
     { OOT_PSP_KANJI_ASSET_NAME, { NULL, NULL, 0, 0, 0, 0, false, false } },
     { OOT_PSP_LINK_ANIMATION_ASSET_NAME, { NULL, NULL, 0, 0, 0, 0, false, false } },
@@ -165,6 +181,148 @@ static void OotPsp_ForgetNativeTextureRangeCache(const OotPspLoadedAssetRange* r
 static void OotPsp_ClearNativeByteRangeCache(void);
 static s32 OotPsp_NormalizeVromRange(uintptr_t vromStart, uintptr_t vromEnd, uintptr_t* normalizedStart,
                                      uintptr_t* normalizedEnd);
+
+static void OotPsp_UnlockUnusedVolatileMemory(void) {
+    if (!sOotPspVolatileMemoryLocked || (sOotPspVolatileCacheAllocationCount != 0)) {
+        return;
+    }
+
+    sceKernelVolatileMemUnlock(0);
+    scePowerUnlock(0);
+    sOotPspVolatileMemoryLocked = false;
+    sOotPspVolatileMemorySize = 0;
+}
+
+static s32 OotPsp_LockVolatileMemory(void) {
+    void* address = NULL;
+    int size = 0;
+    int result;
+
+    if (sOotPspVolatileMemoryLocked) {
+        return true;
+    }
+
+    result = sceKernelVolatileMemLock(0, &address, &size);
+    if (result < 0) {
+        if (!sOotPspVolatileMemoryFailureReported) {
+            printf("oot-psp volatile memory lock failed err=%08X\n", (unsigned int)result);
+            sOotPspVolatileMemoryFailureReported = true;
+        }
+        return false;
+    }
+
+    /* Volatile memory is discarded during suspend, but pinned asset pointers
+     * can live for the whole process. Match the Perfect Dark port and prevent
+     * suspend until the last volatile-backed cache block is released. */
+    result = scePowerLock(0);
+    if (result < 0) {
+        if (!sOotPspVolatileMemoryFailureReported) {
+            printf("oot-psp volatile memory power lock failed err=%08X\n", (unsigned int)result);
+            sOotPspVolatileMemoryFailureReported = true;
+        }
+        sceKernelVolatileMemUnlock(0);
+        return false;
+    }
+
+    sOotPspVolatileMemorySize = size > 0 ? (size_t)size : 0;
+    sOotPspVolatileMemoryLocked = true;
+    sOotPspVolatileMemoryFailureReported = false;
+    return true;
+}
+
+static OotPspCacheAllocation* OotPsp_FindFreeCacheAllocation(void) {
+    size_t i;
+
+    for (i = 0; i < OOT_PSP_CACHE_ALLOCATION_COUNT; i++) {
+        if (sOotPspCacheAllocations[i].address == NULL) {
+            return &sOotPspCacheAllocations[i];
+        }
+    }
+
+    return NULL;
+}
+
+static void* OotPsp_AllocVolatileCacheMemory(size_t size) {
+    OotPspCacheAllocation* allocation = OotPsp_FindFreeCacheAllocation();
+    SceUID blockId;
+    void* address;
+
+    if ((allocation == NULL) || !OotPsp_LockVolatileMemory()) {
+        return NULL;
+    }
+
+    blockId = sceKernelAllocPartitionMemory(5, "OOT PSP asset cache", PSP_SMEM_Low, size, NULL);
+    if (blockId < 0) {
+        OotPsp_UnlockUnusedVolatileMemory();
+        return NULL;
+    }
+
+    address = sceKernelGetBlockHeadAddr(blockId);
+    if (address == NULL) {
+        sceKernelFreePartitionMemory(blockId);
+        OotPsp_UnlockUnusedVolatileMemory();
+        return NULL;
+    }
+
+    allocation->address = address;
+    allocation->blockId = blockId;
+    allocation->size = size;
+    sOotPspVolatileCacheAllocationCount++;
+    sOotPspVolatileCacheBytes += size;
+    printf("oot-psp cache using volatile memory size=%lu used=%lu/%lu\n", (unsigned long)size,
+           (unsigned long)sOotPspVolatileCacheBytes, (unsigned long)sOotPspVolatileMemorySize);
+    return address;
+}
+
+static void* OotPsp_AllocCacheMemory(size_t size) {
+    OotPspCacheAllocation* allocation = OotPsp_FindFreeCacheAllocation();
+    void* address;
+
+    if (allocation == NULL) {
+        return NULL;
+    }
+
+    address = malloc(size);
+    if (address == NULL) {
+        return OotPsp_AllocVolatileCacheMemory(size);
+    }
+
+    allocation->address = address;
+    allocation->blockId = -1;
+    allocation->size = size;
+    return address;
+}
+
+static void OotPsp_FreeCacheMemory(void* address) {
+    size_t i;
+
+    if (address == NULL) {
+        return;
+    }
+
+    for (i = 0; i < OOT_PSP_CACHE_ALLOCATION_COUNT; i++) {
+        OotPspCacheAllocation* allocation = &sOotPspCacheAllocations[i];
+
+        if (allocation->address != address) {
+            continue;
+        }
+
+        if (allocation->blockId >= 0) {
+            sceKernelFreePartitionMemory(allocation->blockId);
+            sOotPspVolatileCacheBytes -= allocation->size;
+            sOotPspVolatileCacheAllocationCount--;
+        } else {
+            free(address);
+        }
+        allocation->address = NULL;
+        allocation->blockId = -1;
+        allocation->size = 0;
+        OotPsp_UnlockUnusedVolatileMemory();
+        return;
+    }
+
+    printf("oot-psp ignored invalid cache free address=%p\n", address);
+}
 
 static void OotPsp_InitAssetSema(void) {
     if (sOotPspAssetSema >= 0) {
@@ -357,7 +515,7 @@ static void OotPsp_InitPackedAssetCache(void) {
 
     sOotPspPackedCacheInitTried = true;
     for (cacheSize = OOT_PSP_PACKED_CACHE_TARGET_SIZE; cacheSize >= OOT_PSP_PACKED_CACHE_MIN_SIZE;) {
-        sOotPspPackedCacheData = malloc(cacheSize);
+        sOotPspPackedCacheData = OotPsp_AllocVolatileCacheMemory(cacheSize);
         if (sOotPspPackedCacheData != NULL) {
             sOotPspPackedCacheBlockCount = cacheSize / OOT_PSP_PACKED_CACHE_BLOCK_SIZE;
             OotPsp_ClearPackedAssetCache();
@@ -519,6 +677,18 @@ static OotPspAssetWindowCache* OotPsp_FindAssetCache(const OotPspExternalAsset* 
     return OotPsp_FindLoadedHotAssetCache(asset);
 }
 
+static s32 OotPsp_IsHotAssetCache(const OotPspAssetWindowCache* cache) {
+    size_t i;
+
+    for (i = 0; i < OOT_PSP_HOT_ASSET_CACHE_COUNT; i++) {
+        if (cache == &sOotPspHotAssetCaches[i]) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static s32 OotPsp_IsAudioAsset(const OotPspExternalAsset* asset) {
     return (asset != NULL) &&
            (OotPsp_AssetNameEquals(asset, OOT_PSP_AUDIOBANK_ASSET_NAME) ||
@@ -593,7 +763,7 @@ static OotPspAssetWindowCache* OotPsp_GetHotAssetCacheCandidate(const OotPspExte
     }
 
     if ((best->asset != NULL) && (best->asset != asset)) {
-        free(best->data);
+        OotPsp_FreeCacheMemory(best->data);
         best->data = NULL;
         best->capacity = 0;
         best->offset = 0;
@@ -989,7 +1159,8 @@ static s32 OotPsp_EnsureAssetCacheRange(OotPspAssetWindowCache* cache, const Oot
             return false;
         }
 
-        data = malloc(capacity);
+        data = OotPsp_IsHotAssetCache(cache) ? OotPsp_AllocVolatileCacheMemory(capacity)
+                                             : OotPsp_AllocCacheMemory(capacity);
         if (data == NULL) {
             printf("oot-psp asset cache alloc failed name=%s size=%lu\n", OotPsp_AssetName(asset),
                    (unsigned long)capacity);
@@ -1020,7 +1191,7 @@ static s32 OotPsp_EnsureAssetCacheRange(OotPspAssetWindowCache* cache, const Oot
     if (!OotPsp_ReadPackedAssetFileRange(asset, windowStart, cache->data, windowSize, false, false,
                                          allowAudioYield)) {
         cache->loading = false;
-        free(cache->data);
+        OotPsp_FreeCacheMemory(cache->data);
         cache->data = NULL;
         cache->capacity = 0;
         cache->offset = 0;
@@ -1036,36 +1207,62 @@ static s32 OotPsp_EnsureAssetCacheRange(OotPspAssetWindowCache* cache, const Oot
 }
 
 static void OotPsp_PreloadPersistentAssets(void) {
-    size_t cacheIndex;
+    s32 preloaded[OOT_PSP_PINNED_ASSET_CACHE_COUNT] = { false };
+    size_t preloadIndex;
 
-    for (cacheIndex = 0; cacheIndex < OOT_PSP_PINNED_ASSET_CACHE_COUNT; cacheIndex++) {
-        OotPspPinnedAssetWindowCache* pinned = &sOotPspPinnedAssetCaches[cacheIndex];
-        OotPspAssetWindowCache* cache = &pinned->cache;
-        size_t assetIndex;
+    /* Allocate the largest pinned ranges first. Audiotable is larger than the
+     * entire volatile partition, so it must get a contiguous normal-heap block
+     * before smaller pinned assets are allowed to consume or fragment it. */
+    for (preloadIndex = 0; preloadIndex < OOT_PSP_PINNED_ASSET_CACHE_COUNT; preloadIndex++) {
+        const OotPspExternalAsset* selectedAsset = NULL;
+        OotPspPinnedAssetWindowCache* selectedPinned = NULL;
+        size_t selectedCacheIndex = 0;
+        size_t selectedFileSize = 0;
+        size_t cacheIndex;
 
-        for (assetIndex = 0; assetIndex < gOotPspExternalAssetCount; assetIndex++) {
-            const OotPspExternalAsset* asset = &gOotPspExternalAssets[assetIndex];
-            size_t fileSize = asset->vromEnd - asset->vromStart;
-            size_t cacheSizeLimit;
+        for (cacheIndex = 0; cacheIndex < OOT_PSP_PINNED_ASSET_CACHE_COUNT; cacheIndex++) {
+            OotPspPinnedAssetWindowCache* pinned = &sOotPspPinnedAssetCaches[cacheIndex];
+            size_t assetIndex;
 
-            if (!OotPsp_AssetNameEquals(asset, pinned->name)) {
+            if (preloaded[cacheIndex]) {
                 continue;
             }
 
-            cache->asset = asset;
-            cacheSizeLimit = OotPsp_GetAssetCacheSizeLimit(asset);
-            if (fileSize > cacheSizeLimit) {
-                printf("oot-psp persistent asset deferred cache name=%s size=%lu window=%lu\n",
-                       OotPsp_AssetName(asset),
-                       (unsigned long)fileSize, (unsigned long)cacheSizeLimit);
+            for (assetIndex = 0; assetIndex < gOotPspExternalAssetCount; assetIndex++) {
+                const OotPspExternalAsset* asset = &gOotPspExternalAssets[assetIndex];
+                size_t fileSize;
+
+                if (!OotPsp_AssetNameEquals(asset, pinned->name)) {
+                    continue;
+                }
+
+                fileSize = asset->vromEnd - asset->vromStart;
+                if ((selectedAsset == NULL) || (fileSize > selectedFileSize)) {
+                    selectedAsset = asset;
+                    selectedPinned = pinned;
+                    selectedCacheIndex = cacheIndex;
+                    selectedFileSize = fileSize;
+                }
                 break;
             }
+        }
 
-            if (!OotPsp_EnsureAssetCacheRange(cache, asset, 0, fileSize, false)) {
-                printf("oot-psp persistent asset preload failed name=%s size=%lu\n", OotPsp_AssetName(asset),
-                       (unsigned long)fileSize);
-            }
+        if (selectedAsset == NULL) {
             break;
+        }
+
+        preloaded[selectedCacheIndex] = true;
+        selectedPinned->cache.asset = selectedAsset;
+        if (selectedFileSize > OotPsp_GetAssetCacheSizeLimit(selectedAsset)) {
+            printf("oot-psp persistent asset deferred cache name=%s size=%lu window=%lu\n",
+                   OotPsp_AssetName(selectedAsset), (unsigned long)selectedFileSize,
+                   (unsigned long)OotPsp_GetAssetCacheSizeLimit(selectedAsset));
+            continue;
+        }
+
+        if (!OotPsp_EnsureAssetCacheRange(&selectedPinned->cache, selectedAsset, 0, selectedFileSize, false)) {
+            printf("oot-psp persistent asset preload failed name=%s size=%lu\n", OotPsp_AssetName(selectedAsset),
+                   (unsigned long)selectedFileSize);
         }
     }
 }

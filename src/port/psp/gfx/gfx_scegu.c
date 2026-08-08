@@ -544,6 +544,8 @@ static bool gfx_scegu_ensure_home_menu_font(void) {
         if (intraFontInit()) {
             sHomeMenuFont = intraFontLoad("flash0:/font/ltn0.pgf", INTRAFONT_CACHE_ASCII);
         }
+
+        printf("oot-psp home menu font %s\n", (sHomeMenuFont != NULL) ? "loaded" : "load failed");
     }
 
     return sHomeMenuFont != NULL;

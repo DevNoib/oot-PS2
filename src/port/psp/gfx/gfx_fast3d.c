@@ -4289,13 +4289,12 @@ static void gfx_sp_triangles(uint32_t packed0, uint32_t packed1, uint8_t triangl
 /* This will be going away possibly, it all depends on how we end up treating hw sprites */
 #if defined(TARGET_PSP)
 static inline void gfx_normalize_2d_repeat_axis(short* first, short* second, uint8_t cm, uint8_t mask,
-                                                uint16_t period) {
+                                                uint16_t period, bool repeatNomask) {
     int32_t minimum;
     int32_t maximum;
     int32_t offset;
 
-    /* Match the backend's sampler choice: a zero mask or CLAMP selects GU_CLAMP. */
-    if ((cm & G_TX_CLAMP) || mask == G_TX_NOMASK || period == 0) {
+    if ((cm & G_TX_CLAMP) || (!repeatNomask && mask == G_TX_NOMASK) || period == 0) {
         return;
     }
 
@@ -4315,15 +4314,19 @@ static inline void gfx_normalize_2d_repeat_axis(short* first, short* second, uin
 }
 
 static inline void gfx_normalize_2d_repeat_uvs(VertexColor vertices[2], const TextureTileState* tileState,
-                                                const struct TextureHashmapNode* texture) {
+                                                const struct TextureHashmapNode* texture, bool repeatNomask) {
     if (texture == NULL) {
         return;
     }
 
     gfx_normalize_2d_repeat_axis(&vertices[0].u, &vertices[1].u, tileState->cms, tileState->masks,
-                                 texture->upload_width);
+                                 texture->upload_width, repeatNomask);
     gfx_normalize_2d_repeat_axis(&vertices[0].v, &vertices[1].v, tileState->cmt, tileState->maskt,
-                                 texture->upload_height);
+                                 texture->upload_height, repeatNomask);
+}
+
+static inline uint8_t gfx_2d_physical_repeat_mask(uint8_t cm, uint8_t mask, bool repeatNomask) {
+    return repeatNomask && !(cm & G_TX_CLAMP) && mask == G_TX_NOMASK ? 1 : mask;
 }
 #endif
 
@@ -4342,6 +4345,7 @@ static void gfx_sp_tri1_2d(uint8_t vtx1_idx, uint8_t vtx2_idx, UNUSED uint8_t vt
 #if defined(TARGET_PSP)
     const bool twoTextureBlend =
         state->two_texture_blend && rendering_state.textures[0] != NULL && rendering_state.textures[1] != NULL;
+    bool baseSamplerOverridden = false;
     uint8_t secondPassAlpha[2] = { 0 };
 #endif
     //uint32_t tex_width = (tileState->lrs - tileState->uls + 4) / 4;
@@ -4426,8 +4430,19 @@ static void gfx_sp_tri1_2d(uint8_t vtx1_idx, uint8_t vtx2_idx, UNUSED uint8_t vt
     }
 
 #if defined(TARGET_PSP)
-    if (use_texture && rendering_state.textures[texture_tile] != NULL) {
-        gfx_normalize_2d_repeat_uvs(tri_buf, tileState, rendering_state.textures[texture_tile]);
+    if (twoTextureBlend && use_texture && rendering_state.textures[texture_tile] != NULL) {
+        const uint8_t physicalMasks =
+            gfx_2d_physical_repeat_mask(tileState->cms, tileState->masks, true);
+        const uint8_t physicalMaskt =
+            gfx_2d_physical_repeat_mask(tileState->cmt, tileState->maskt, true);
+
+        gfx_normalize_2d_repeat_uvs(tri_buf, tileState, rendering_state.textures[texture_tile], true);
+        baseSamplerOverridden = physicalMasks != tileState->masks || physicalMaskt != tileState->maskt;
+        if (baseSamplerOverridden) {
+            gfx_rapi->set_sampler_parameters(texture_tile,
+                                             rendering_state.textures[texture_tile]->linear_filter,
+                                             tileState->cms, tileState->cmt, physicalMasks, physicalMaskt);
+        }
     }
 
     if (use_texture && !state->flame_texture_atlas && rendering_state.textures[texture_tile] != NULL) {
@@ -4444,6 +4459,12 @@ static void gfx_sp_tri1_2d(uint8_t vtx1_idx, uint8_t vtx2_idx, UNUSED uint8_t vt
         const TextureTileState* tile1State = gfx_get_texture_tile(1);
         const float shiftScaleS = gfx_texture_shift_scale(tile1State->shifts);
         const float shiftScaleT = gfx_texture_shift_scale(tile1State->shiftt);
+        const uint8_t physicalMasks =
+            gfx_2d_physical_repeat_mask(tile1State->cms, tile1State->masks, true);
+        const uint8_t physicalMaskt =
+            gfx_2d_physical_repeat_mask(tile1State->cmt, tile1State->maskt, true);
+        const bool secondSamplerOverridden =
+            physicalMasks != tile1State->masks || physicalMaskt != tile1State->maskt;
 
         for (int i = 0; i < 2; i++) {
             tri_buf[i].u = ((v_arr[i]->u * shiftScaleS) - tile1State->uls * 8) / 32;
@@ -4451,11 +4472,26 @@ static void gfx_sp_tri1_2d(uint8_t vtx1_idx, uint8_t vtx2_idx, UNUSED uint8_t vt
             tri_buf[i].color.a = secondPassAlpha[i];
         }
 
-        gfx_normalize_2d_repeat_uvs(tri_buf, tile1State, rendering_state.textures[1]);
+        gfx_normalize_2d_repeat_uvs(tri_buf, tile1State, rendering_state.textures[1], true);
 
+        if (secondSamplerOverridden) {
+            gfx_rapi->set_sampler_parameters(1, rendering_state.textures[1]->linear_filter,
+                                             tile1State->cms, tile1State->cmt,
+                                             physicalMasks, physicalMaskt);
+        }
         gfx_rapi->select_texture(1, rendering_state.textures[1]->texture_id);
         gfx_scegu_draw_triangles_2d((float*)&tri_buf[0], 0, 1);
         gfx_rapi->set_use_alpha(rendering_state.alpha_blend);
+        if (secondSamplerOverridden) {
+            gfx_rapi->set_sampler_parameters(1, rendering_state.textures[1]->linear_filter,
+                                             tile1State->cms, tile1State->cmt,
+                                             tile1State->masks, tile1State->maskt);
+        }
+        if (baseSamplerOverridden) {
+            gfx_rapi->set_sampler_parameters(0, rendering_state.textures[0]->linear_filter,
+                                             tileState->cms, tileState->cmt,
+                                             tileState->masks, tileState->maskt);
+        }
         gfx_rapi->select_texture(0, rendering_state.textures[0]->texture_id);
         rendering_state.bound_texture_id = rendering_state.textures[0]->texture_id;
         rendering_state.bound_texture_tile = 0;
@@ -5078,31 +5114,20 @@ static bool gfx_cc_is_two_texture_prim_lod_tint(uint32_t rgbA0, uint32_t rgbB0, 
            gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1);
 }
 
-static bool gfx_cc_is_two_texture_crossfade_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
-                                                  uint32_t rgbD0, uint32_t alphaA0, uint32_t alphaB0,
-                                                  uint32_t alphaC0, uint32_t alphaD0, uint32_t rgbA1,
-                                                  uint32_t rgbB1, uint32_t rgbC1, uint32_t rgbD1,
-                                                  uint32_t alphaA1, uint32_t alphaB1, uint32_t alphaC1,
-                                                  uint32_t alphaD1) {
-    const bool rgbCrossfade =
-        (rgbA0 == G_CCMUX_TEXEL1) && (rgbB0 == G_CCMUX_TEXEL0) &&
-        ((rgbC0 == G_CCMUX_PRIM_LOD_FRAC) || (rgbC0 == G_CCMUX_ENV_ALPHA) ||
-         (rgbC0 == G_CCMUX_LOD_FRACTION)) &&
-        (rgbD0 == G_CCMUX_TEXEL0);
-    const bool alphaCrossfade =
-        (alphaA0 == G_ACMUX_TEXEL1) && (alphaB0 == G_ACMUX_TEXEL0) &&
-        ((alphaC0 == G_ACMUX_PRIM_LOD_FRAC) || (alphaC0 == G_ACMUX_ENVIRONMENT) ||
-         (alphaC0 == G_ACMUX_LOD_FRACTION)) &&
-        (alphaD0 == G_ACMUX_TEXEL0);
-    const bool colorTint =
-        (rgbA1 == G_CCMUX_PRIMITIVE) && (rgbB1 == G_CCMUX_ENVIRONMENT) &&
-        (rgbC1 == G_CCMUX_COMBINED) && (rgbD1 == G_CCMUX_ENVIRONMENT);
-    const bool alphaModulated =
-        gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1) ||
-        gfx_cc_is_combined_mul_shade(alphaA1, alphaB1, alphaC1, alphaD1) ||
-        gfx_cc_is_combined_mul_environment(alphaA1, alphaB1, alphaC1, alphaD1);
-
-    return rgbCrossfade && alphaCrossfade && colorTint && alphaModulated;
+static bool gfx_cc_is_weather_crossfade_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
+                                              uint32_t rgbD0, uint32_t alphaA0, uint32_t alphaB0,
+                                              uint32_t alphaC0, uint32_t alphaD0, uint32_t rgbA1,
+                                              uint32_t rgbB1, uint32_t rgbC1, uint32_t rgbD1,
+                                              uint32_t alphaA1, uint32_t alphaB1, uint32_t alphaC1,
+                                              uint32_t alphaD1) {
+    return (rgbA0 == G_CCMUX_TEXEL1) && (rgbB0 == G_CCMUX_TEXEL0) &&
+           (rgbC0 == G_CCMUX_PRIM_LOD_FRAC) && (rgbD0 == G_CCMUX_TEXEL0) &&
+           (alphaA0 == G_ACMUX_TEXEL1) && (alphaB0 == G_ACMUX_TEXEL0) &&
+           ((alphaC0 == G_ACMUX_ENVIRONMENT) || (alphaC0 == G_ACMUX_PRIM_LOD_FRAC)) &&
+           (alphaD0 == G_ACMUX_TEXEL0) &&
+           (rgbA1 == G_CCMUX_PRIMITIVE) && (rgbB1 == G_CCMUX_ENVIRONMENT) &&
+           (rgbC1 == G_CCMUX_COMBINED) && (rgbD1 == G_CCMUX_ENVIRONMENT) &&
+           gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1);
 }
 
 static bool gfx_cc_is_two_texture_self_modulated_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
@@ -5323,37 +5348,19 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
         twoTextureAlphaBlend = true;
     }
 
-    if (gfx_cc_is_two_texture_crossfade_tint(rgbA0, rgbB0, rgbC0, rgbD0, alphaA0, alphaB0,
-                                             alphaC0, alphaD0, rgbA1, rgbB1, rgbC1, rgbD1,
-                                             alphaA1, alphaB1, alphaC1, alphaD1)) {
-        /* Sandstorms and several weather/magic/item materials crossfade two independently scrolling maps,
-         * then tint the result between ENVIRONMENT and PRIMITIVE. The compact combiner previously retained
-         * TEXEL0 but silently discarded TEXEL1. Reuse the shared two-pass path and canonicalize each pass to
-         * the texture currently bound by that path. */
+    if (gfx_cc_is_weather_crossfade_tint(rgbA0, rgbB0, rgbC0, rgbD0, alphaA0, alphaB0,
+                                         alphaC0, alphaD0, rgbA1, rgbB1, rgbC1, rgbD1,
+                                         alphaA1, alphaB1, alphaC1, alphaD1)) {
+        /* The desert sandstorm and Song of Storms fullscreen overlay both crossfade independently scrolling
+         * maps with PRIM_LOD_FRAC. ENV_ALPHA-driven silhouettes such as the sun remain on the single-pass
+         * texture-alpha path instead of becoming rectangular framebuffer layers. */
         rgbComb = color_comb(G_CCMUX_TEXEL0, G_CCMUX_0, G_CCMUX_PRIMITIVE, G_CCMUX_0);
-        if (gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1)) {
-            alphaComb = color_comb(G_ACMUX_TEXEL0, G_ACMUX_0, G_ACMUX_PRIMITIVE, G_ACMUX_0);
-        } else if (gfx_cc_is_combined_mul_shade(alphaA1, alphaB1, alphaC1, alphaD1)) {
-            alphaComb = color_comb(G_ACMUX_TEXEL0, G_ACMUX_0, G_ACMUX_SHADE, G_ACMUX_0);
-        } else {
-            alphaComb = color_comb(G_ACMUX_0, G_ACMUX_0, G_ACMUX_0, G_ACMUX_TEXEL0);
-            alphaMulEnv = true;
-        }
+        alphaComb = color_comb(G_ACMUX_TEXEL0, G_ACMUX_0, G_ACMUX_PRIMITIVE, G_ACMUX_0);
         textureBlend = true;
         twoTextureBlend = true;
-        /* LOD_FRACTION materials program PRIM_LOD_FRAC as their fixed PSP fallback, matching the existing
-         * two-texture path. ENV_ALPHA remains the alternate animated crossfade source. */
-        twoTextureBlendUsesPrimLod = rgbC0 != G_CCMUX_ENV_ALPHA;
-
-        /*
-         * The sandstorm crossfades its RGB with PRIM_LOD_FRAC, but its alpha
-         * with ENV_ALPHA. Its TEXEL1 (IA8) layer is fully opaque, whereas the
-         * usual two-texture alpha compensation below assumes TEXEL0 is the
-         * opaque layer. Use ordinary source-over weights for this material so
-         * the second pass adds haze instead of replacing the scene.
-         */
-        twoTextureAlphaBlend =
-            !((rgbC0 == G_CCMUX_PRIM_LOD_FRAC) && (alphaC0 == G_ACMUX_ENVIRONMENT));
+        twoTextureBlendUsesPrimLod = true;
+        /* Desert TEXEL1 is fully opaque; Song of Storms crossfades alpha from both intensity maps. */
+        twoTextureAlphaBlend = alphaC0 == G_ACMUX_PRIM_LOD_FRAC;
     }
 
     if (gfx_cc_is_two_texture_self_modulated_tint(rgbA0, rgbB0, rgbC0, rgbD0, alphaA0, alphaB0,
