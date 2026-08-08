@@ -29,7 +29,23 @@ static inline __attribute__((always_inline)) float OotPsp_Sqrtf(float value) {
 #define sqrt(value) OotPsp_Sqrtf((float)(value))
 #endif
 
-int OotPsp_IsSystemHeapRange(const void* ptr, size_t size);
+#define OOT_PSP_SYSTEM_HEAP_SIZE (4U * 1024U * 1024U)
+
+extern unsigned char gOotPspSystemHeap[OOT_PSP_SYSTEM_HEAP_SIZE];
+
+static inline __attribute__((always_inline)) int OotPsp_IsSystemHeapRange(const void* ptr, size_t size) {
+    uintptr_t start = (uintptr_t)ptr;
+    uintptr_t end;
+    const uintptr_t heapStart = (uintptr_t)gOotPspSystemHeap;
+    const uintptr_t heapEnd = heapStart + OOT_PSP_SYSTEM_HEAP_SIZE;
+
+    if ((ptr == NULL) || (size == 0) || (start > UINTPTR_MAX - size)) {
+        return 0;
+    }
+
+    end = start + size;
+    return (start >= heapStart) && (end <= heapEnd);
+}
 
 extern unsigned char __bss_start[];
 extern unsigned char _end[];

@@ -145,7 +145,12 @@ extern void gfx_transform_vertices_vfpu(struct LoadedVertex* dest, const Vtx* so
 #endif
 
 typedef struct VertexColor {
-	unsigned short u, v;
+	/* Texture rectangles commonly use a negative dtdy (the sandstorm is one),
+	 * so keep the coordinates signed while the CPU applies tile shifts and
+	 * origins. Repeat coordinates are normalized before GU submission because
+	 * its 16-bit sprite path otherwise interprets the negative bit pattern as a
+	 * very large coordinate. */
+	short u, v;
 	struct RGBA color;
 	unsigned short x, y, z;
 } VertexColor __attribute__((aligned(16)));
@@ -162,6 +167,7 @@ struct TextureHashmapNode {
     uint32_t source_key;
     const uint8_t* palette_addr;
     uint32_t palette_key;
+    uint32_t last_used_frame;
     uint16_t upload_width, upload_height;
 #endif
     
@@ -178,6 +184,9 @@ static struct {
     struct TextureHashmapNode pool[512];
     uint32_t pool_pos;
 } gfx_texture_cache;
+#if defined(TARGET_PSP)
+static uint32_t sTextureCacheFrameSerial;
+#endif
 
 struct ColorCombiner {
     uint32_t cc_id;
@@ -186,6 +195,7 @@ struct ColorCombiner {
     int8_t active_texture;
     uint8_t vertex_color_source[2];
     bool texture_blend;
+    bool uses_texture_alpha;
 } __attribute__((packed, aligned(4)));
 
 #define COLOR_COMBINER_CACHE_SET_COUNT 32
@@ -206,6 +216,7 @@ struct TriPipelineState {
     bool two_texture_blend;
     bool two_texture_blend_uses_prim_lod;
     bool two_texture_alpha_blend;
+    bool fog_uses_texture_alpha;
     bool flame_texture_atlas;
     bool texture_tint_colors_corrected;
     bool two_texture_uncompensated_alpha;
@@ -365,13 +376,22 @@ static bool sUploadedProjectionValid;
 static uint8_t sInvalidTextureBuf[256] __attribute__((aligned(16))) = { 0xff, 0xff, 0xff, 0xff };
 static uint8_t sInvalidPaletteBuf[512] __attribute__((aligned(16))) = { 0xff, 0xff };
 static struct GfxCmdSnapshot sCurrentCmd;
-#define GFX_VALIDATED_POINTER_CACHE_SIZE 256
+#define GFX_VALIDATED_DL_CURSOR_CACHE_SIZE 256
+#define GFX_VALIDATED_READ_CACHE_SIZE 256
+#define GFX_SEGMENT_ADDRESS_CACHE_SIZE 512
 typedef struct GfxValidatedReadCacheEntry {
     uintptr_t addr;
     size_t size;
 } GfxValidatedReadCacheEntry;
-static uintptr_t sValidatedDlCursorCache[GFX_VALIDATED_POINTER_CACHE_SIZE];
-static GfxValidatedReadCacheEntry sValidatedReadCache[GFX_VALIDATED_POINTER_CACHE_SIZE];
+typedef struct GfxSegmentAddressCacheEntry {
+    uintptr_t raw;
+    uintptr_t rspBase;
+    uintptr_t globalBase;
+    void* resolved;
+} GfxSegmentAddressCacheEntry;
+static uintptr_t sValidatedDlCursorCache[GFX_VALIDATED_DL_CURSOR_CACHE_SIZE];
+static GfxValidatedReadCacheEntry sValidatedReadCache[GFX_VALIDATED_READ_CACHE_SIZE];
+static GfxSegmentAddressCacheEntry sSegmentAddressCache[GFX_SEGMENT_ADDRESS_CACHE_SIZE];
 #if OOT_PSP_GFX_DIAGNOSTICS
 #define GFX_CAPTURE_CMD(dst, src) ((dst) = (src))
 #else
@@ -536,7 +556,7 @@ static bool gfx_is_valid_native_read_range(uintptr_t value, size_t size) {
 
     /*
      * Keep this provenance set in sync with gfx_is_valid_native_dl_range().
-     * Display lists and texture staging data allocated from sPspSystemHeap can
+     * Display lists and texture staging data allocated from gOotPspSystemHeap can
      * numerically look like segments 8-B.  If the heap is omitted here,
      * seg_addr() translates a valid pointer through the active N64 segment and
      * sends the renderer into unrelated frame data.
@@ -554,7 +574,7 @@ static bool gfx_is_valid_native_read_range(uintptr_t value, size_t size) {
 }
 
 static inline bool gfx_is_valid_native_read_range_cached(uintptr_t value, size_t size) {
-    const size_t cacheIndex = ((value >> 4) ^ size) & (GFX_VALIDATED_POINTER_CACHE_SIZE - 1);
+    const size_t cacheIndex = ((value >> 4) ^ size) & (GFX_VALIDATED_READ_CACHE_SIZE - 1);
 
     if ((sValidatedReadCache[cacheIndex].addr == value) &&
         (sValidatedReadCache[cacheIndex].size == size)) {
@@ -600,27 +620,6 @@ static void gfx_log_bad_data_source(const char* context, const void* addr, size_
     }
 
     sBadDataSourceLogCount++;
-}
-
-static bool gfx_normalize_read_source(const void* addr, size_t sizeBytes, const char* context, const void** normalized) {
-    uintptr_t normalizedValue;
-    size_t cacheIndex;
-
-    if (gfx_normalize_native_range((uintptr_t)addr, sizeBytes, &normalizedValue)) {
-        cacheIndex = ((normalizedValue >> 4) ^ sizeBytes) & (GFX_VALIDATED_POINTER_CACHE_SIZE - 1);
-        if ((sValidatedReadCache[cacheIndex].addr == normalizedValue) &&
-            (sValidatedReadCache[cacheIndex].size == sizeBytes)) {
-            *normalized = (const void*)normalizedValue;
-            return true;
-        }
-        if (gfx_is_valid_native_read_range_cached(normalizedValue, sizeBytes)) {
-            *normalized = (const void*)normalizedValue;
-            return true;
-        }
-    }
-
-    gfx_log_bad_data_source(context, addr, sizeBytes);
-    return false;
 }
 
 static void gfx_log_bad_texture_source(int tile, const char* context, const uint8_t* addr, uint32_t sizeBytes) {
@@ -674,17 +673,34 @@ static bool gfx_normalize_texture_source(const uint8_t** addr, uint32_t sizeByte
 }
 
 static uint32_t gfx_texture_palette_key(const uint8_t* addr, uint32_t sizeBytes) {
-    uint32_t key = OotPsp_GetExternalAssetRangeSerial(addr, sizeBytes);
+    uint32_t key;
     const uint8_t* bytes = addr;
 
+    /* Normal-sky TLUTs combine two independently loaded 128-color assets in
+     * one 256-color buffer. Query those halves before the full range: a failed
+     * full-range query is negatively cached and would hide the two valid asset
+     * serials from the narrower queries. This also avoids hashing 512 bytes on
+     * every frame while keeping sky-palette DMA replacements visible. */
+    if (sizeBytes == GFX_TLUT_SIZE_BYTES) {
+        const uint32_t halfSize = sizeBytes / 2;
+        const uint32_t firstSerial = OotPsp_GetExternalAssetRangeSerial(addr, halfSize);
+        const uint32_t secondSerial = OotPsp_GetExternalAssetRangeSerial(addr + halfSize, halfSize);
+
+        if ((firstSerial != 0) && (secondSerial != 0)) {
+            key = 2166136261U;
+            key = (key ^ firstSerial) * 16777619U;
+            key = (key ^ secondSerial) * 16777619U;
+            return key != 0 ? key : 1;
+        }
+    }
+
+    key = OotPsp_GetExternalAssetRangeSerial(addr, sizeBytes);
     if (key != 0) {
         return key;
     }
 
-    /* Normal-sky TLUTs combine two independently loaded 128-color assets in
-     * one 256-color buffer, so no single asset serial covers the whole span.
-     * Hash that composite buffer instead of treating its stable address as an
-     * immutable palette. */
+    /* Runtime palettes have no asset serial. Hash their contents so in-place
+     * changes still invalidate the converted CI texture. */
     if (!gfx_normalize_texture_source(&bytes, sizeBytes)) {
         return 0;
     }
@@ -863,20 +879,28 @@ typedef struct psp_uv_t {
   float u,v;
   uint8_t alpha;
 } psp_uv_t;
-typedef struct psp_fog_t {
+typedef struct psp_fog_color_t {
+  struct RGBA color;
+  float x,y,z;
+} psp_fog_color_t;
+typedef struct psp_fog_textured_t {
   float u,v;
   struct RGBA color;
   float x,y,z;
-} psp_fog_t;
-typedef char psp_fog_t_size_check[(sizeof(psp_fog_t) == 24) ? 1 : -1];
+} psp_fog_textured_t;
+typedef union psp_fog_buffer_t {
+  psp_fog_color_t color[MAX_BUFFERED * 3];
+  psp_fog_textured_t textured[MAX_BUFFERED * 3];
+} psp_fog_buffer_t;
+typedef char psp_fog_color_t_size_check[(sizeof(psp_fog_color_t) == 16) ? 1 : -1];
+typedef char psp_fog_textured_t_size_check[(sizeof(psp_fog_textured_t) == 24) ? 1 : -1];
 static psp_fast_t buf_vbo[MAX_BUFFERED  * 3] __attribute__ ((aligned (32))); // 3 vertices in a triangle and 26 floats per vtx
 static psp_uv_t buf_vbo_tex1[MAX_BUFFERED * 3] __attribute__((aligned(32)));
-static psp_fog_t buf_vbo_fog[MAX_BUFFERED * 3] __attribute__((aligned(32)));
+static psp_fog_buffer_t buf_vbo_fog __attribute__((aligned(32)));
 static uint8_t buf_vbo_fog_tex1_alpha[MAX_BUFFERED * 3] __attribute__((aligned(32)));
-static GFX_DL_HANDLER void gfx_two_texture_blend_pass_alphas(uint8_t surfaceAlpha, uint8_t mixAlpha,
-                                                             bool blendTextureAlpha,
-                                                             bool uncompensatedTextureAlpha,
-                                                             uint8_t* baseAlpha, uint8_t* overlayAlpha);
+static inline __attribute__((always_inline)) void gfx_two_texture_blend_pass_alphas(
+    uint8_t surfaceAlpha, uint8_t mixAlpha, bool blendTextureAlpha,
+    bool uncompensatedTextureAlpha, uint8_t* baseAlpha, uint8_t* overlayAlpha);
 #else
 static float buf_vbo[MAX_BUFFERED * (26 * 3)] // 3 vertices in a triangle and 26 floats per vtx
 #endif
@@ -1349,20 +1373,41 @@ static uint32_t clipToHyperPlane( struct LoadedVertex *dest, const struct Loaded
 #endif
 }
 
-uint32_t clip_to_frustum( struct LoadedVertex * v0, struct LoadedVertex * v1, uint32_t vIn )
+static uint32_t clip_to_frustum(struct LoadedVertex* v0, struct LoadedVertex* v1, uint32_t vIn,
+                                uint32_t clipFlags, struct LoadedVertex** clippedVertices)
 {
-	uint32_t vOut;
+    struct LoadedVertex* source = v0;
+    struct LoadedVertex* dest = v1;
+    struct LoadedVertex* swap;
+    uint32_t vOut = vIn;
 
-	vOut = vIn;
+    /* A convex polygon whose vertices are all inside a plane remains inside
+     * it while clipping against another plane. Only visit planes rejected by
+     * at least one of the original triangle's vertices. */
+#define CLIP_TO_PLANE_IF_NEEDED(flag, plane)                        \
+    do {                                                           \
+        if (clipFlags & (flag)) {                                  \
+            vOut = clipToHyperPlane(dest, source, vOut, (plane));  \
+            swap = source;                                         \
+            source = dest;                                         \
+            dest = swap;                                           \
+            if (vOut == 0) {                                       \
+                goto clippingComplete;                             \
+            }                                                      \
+        }                                                          \
+    } while (0)
 
-	vOut = clipToHyperPlane( v1, v0, vOut, NDCPlane[2] );		// right
-	vOut = clipToHyperPlane( v0, v1, vOut, NDCPlane[1] );		// left
-	vOut = clipToHyperPlane( v1, v0, vOut, NDCPlane[4] );		// top
-	vOut = clipToHyperPlane( v0, v1, vOut, NDCPlane[3] );		// bottom
-	vOut = clipToHyperPlane( v1, v0, vOut, NDCPlane[0] );		// near
-	vOut = clipToHyperPlane( v0, v1, vOut, NDCPlane[5] );		// far
+    CLIP_TO_PLANE_IF_NEEDED(X_POS, NDCPlane[2]); // right
+    CLIP_TO_PLANE_IF_NEEDED(X_NEG, NDCPlane[1]); // left
+    CLIP_TO_PLANE_IF_NEEDED(Y_POS, NDCPlane[4]); // top
+    CLIP_TO_PLANE_IF_NEEDED(Y_NEG, NDCPlane[3]); // bottom
+    CLIP_TO_PLANE_IF_NEEDED(Z_POS, NDCPlane[0]); // near
+    CLIP_TO_PLANE_IF_NEEDED(Z_NEG, NDCPlane[5]); // far
 
-	return vOut;
+clippingComplete:
+#undef CLIP_TO_PLANE_IF_NEEDED
+    *clippedVertices = source;
+    return vOut;
 }
 
 static struct LoadedVertex temp_a[12];
@@ -1373,7 +1418,8 @@ static struct LoadedVertex temp_b[12];
 static struct LoadedVertex sClippedVertices[21] __attribute__((aligned(16)));
 static struct LoadedVertex* sClippedVertexPtrs[21];
 
-void gfx_clip_single_vert( struct LoadedVertex *p_p_vertices, size_t *p_num_vertices, struct LoadedVertex *v_arr[3])
+void gfx_clip_single_vert(struct LoadedVertex* p_p_vertices, size_t* p_num_vertices,
+                          struct LoadedVertex* v_arr[3], uint32_t clipFlags)
 {
 	//
 	//	At this point all vertices are lit/projected and have both transformed and projected
@@ -1391,7 +1437,8 @@ void gfx_clip_single_vert( struct LoadedVertex *p_p_vertices, size_t *p_num_vert
     temp_a[ 1 ] = *v_arr[ 1 ];
     temp_a[ 2 ] = *v_arr[ 2 ];
 
-    uint32_t out = clip_to_frustum( temp_a, temp_b, 3 );
+    struct LoadedVertex* clippedPolygon;
+    uint32_t out = clip_to_frustum(temp_a, temp_b, 3, clipFlags, &clippedPolygon);
     if( out < 3 ){
         *p_num_vertices = 0;
         return;
@@ -1400,9 +1447,9 @@ void gfx_clip_single_vert( struct LoadedVertex *p_p_vertices, size_t *p_num_vert
     // Retesselate
     for( uint32_t j = 0; j <= out - 3; ++j )
     {            
-        p_p_vertices[clipped_vertices_num++] = ( temp_a[ 0 ] );
-        p_p_vertices[clipped_vertices_num++] = ( temp_a[ j + 1 ] );
-        p_p_vertices[clipped_vertices_num++] = ( temp_a[ j + 2 ] );
+        p_p_vertices[clipped_vertices_num++] = clippedPolygon[0];
+        p_p_vertices[clipped_vertices_num++] = clippedPolygon[j + 1];
+        p_p_vertices[clipped_vertices_num++] = clippedPolygon[j + 2];
     }
 
 	*p_num_vertices = clipped_vertices_num;
@@ -1418,8 +1465,29 @@ static void gfx_flush(void) {
         const bool twoTextureBlend = rendering_state.tri_pipeline.two_texture_blend &&
                                      rendering_state.textures[0] != NULL && rendering_state.textures[1] != NULL;
         const bool useFog = rendering_state.tri_pipeline.use_fog;
+        const bool fogUsesTextureAlpha = rendering_state.tri_pipeline.fog_uses_texture_alpha;
         const bool twoTextureAlphaFog =
             useFog && twoTextureBlend && rendering_state.tri_pipeline.two_texture_alpha_blend;
+
+        /* The cache may refresh an animated palette in place on a later
+         * frame. Record the allocations consumed by this GU list so a second
+         * palette value in the same frame gets a separate allocation instead
+         * of changing pixels underneath an already queued draw. */
+        if (rendering_state.tri_pipeline.use_texture && !rendering_state.tri_pipeline.flame_texture_atlas) {
+            if (twoTextureBlend) {
+                rendering_state.textures[0]->last_used_frame = sTextureCacheFrameSerial;
+                rendering_state.textures[1]->last_used_frame = sTextureCacheFrameSerial;
+            } else {
+                int activeTexture = rendering_state.tri_pipeline.comb->active_texture;
+
+                if (activeTexture < 0) {
+                    activeTexture = rendering_state.tri_pipeline.used_textures[0] ? 0 : 1;
+                }
+                if (rendering_state.textures[activeTexture] != NULL) {
+                    rendering_state.textures[activeTexture]->last_used_frame = sTextureCacheFrameSerial;
+                }
+            }
+        }
 
 #if defined(OOTDEBUG)
         sPerformanceFlushCount++;
@@ -1468,24 +1536,38 @@ static void gfx_flush(void) {
             sPerformanceTranslucentDrawCallCount += twoTextureAlphaFog ? 2 : 1;
             sPerformanceTranslucentTriangleCount += buf_vbo_num_tris * (twoTextureAlphaFog ? 2 : 1);
 #endif
+            float* fogBuffer = fogUsesTextureAlpha ? (float*)buf_vbo_fog.textured
+                                                   : (float*)buf_vbo_fog.color;
+            const size_t fogBufferLen =
+                (fogUsesTextureAlpha ? sizeof(psp_fog_textured_t) : sizeof(psp_fog_color_t)) *
+                buf_num_vert;
+
             if (twoTextureAlphaFog) {
-                gfx_rapi->draw_fog_triangles((float *)buf_vbo_fog, sizeof(psp_fog_t) * buf_num_vert,
-                                             buf_vbo_num_tris);
+                gfx_rapi->draw_fog_triangles(fogBuffer, fogBufferLen, buf_vbo_num_tris,
+                                             fogUsesTextureAlpha, false);
 
                 for (size_t i = 0; i < buf_num_vert; i++) {
-                    buf_vbo_fog[i].u = buf_vbo_tex1[i].u;
-                    buf_vbo_fog[i].v = buf_vbo_tex1[i].v;
-                    buf_vbo_fog[i].color.a = buf_vbo_fog_tex1_alpha[i];
+                    if (fogUsesTextureAlpha) {
+                        buf_vbo_fog.textured[i].u = buf_vbo_tex1[i].u;
+                        buf_vbo_fog.textured[i].v = buf_vbo_tex1[i].v;
+                        buf_vbo_fog.textured[i].color.a = buf_vbo_fog_tex1_alpha[i];
+                    } else {
+                        buf_vbo_fog.color[i].color.a = buf_vbo_fog_tex1_alpha[i];
+                    }
                 }
-                gfx_rapi->select_texture(1, rendering_state.textures[1]->texture_id);
-                gfx_rapi->draw_fog_triangles((float *)buf_vbo_fog, sizeof(psp_fog_t) * buf_num_vert,
-                                             buf_vbo_num_tris);
-                gfx_rapi->select_texture(0, rendering_state.textures[0]->texture_id);
-                rendering_state.bound_texture_id = rendering_state.textures[0]->texture_id;
-                rendering_state.bound_texture_tile = 0;
+                if (fogUsesTextureAlpha) {
+                    gfx_rapi->select_texture(1, rendering_state.textures[1]->texture_id);
+                }
+                gfx_rapi->draw_fog_triangles(fogBuffer, fogBufferLen, buf_vbo_num_tris,
+                                             fogUsesTextureAlpha, true);
+                if (fogUsesTextureAlpha) {
+                    gfx_rapi->select_texture(0, rendering_state.textures[0]->texture_id);
+                    rendering_state.bound_texture_id = rendering_state.textures[0]->texture_id;
+                    rendering_state.bound_texture_tile = 0;
+                }
             } else {
-                gfx_rapi->draw_fog_triangles((float *)buf_vbo_fog, sizeof(psp_fog_t) * buf_num_vert,
-                                             buf_vbo_num_tris);
+                gfx_rapi->draw_fog_triangles(fogBuffer, fogBufferLen, buf_vbo_num_tris,
+                                             fogUsesTextureAlpha, true);
             }
         }
 #endif
@@ -1587,6 +1669,17 @@ static void gfx_generate_cc(struct ColorCombiner *comb, uint32_t cc_id) {
         (cc_features.used_textures[0] && cc_features.used_textures[1]) ? (cc_features.do_single[1] ? 1 : 0) :
         (cc_features.used_textures[0] ? 0 : (cc_features.used_textures[1] ? 1 : -1));
 #endif
+    comb->uses_texture_alpha = false;
+    if (cc_features.opt_alpha) {
+        for (int i = 0; i < 4; i++) {
+            if ((cc_features.c[1][i] == SHADER_TEXEL0) ||
+                (cc_features.c[1][i] == SHADER_TEXEL0A) ||
+                (cc_features.c[1][i] == SHADER_TEXEL1)) {
+                comb->uses_texture_alpha = true;
+                break;
+            }
+        }
+    }
     comb->vertex_color_source[0] =
         gfx_cc_pick_vertex_color_source(c[0], shader_input_mapping[0], shader_input_count[0]);
     comb->vertex_color_source[1] =
@@ -1635,13 +1728,26 @@ static inline void gfx_color_mul_prim(struct RGBA* color) {
 }
 
 #if defined(TARGET_PSP)
-static GFX_DL_HANDLER void gfx_two_texture_blend_pass_alphas(uint8_t surfaceAlpha, uint8_t mixAlpha,
-                                                             bool blendTextureAlpha,
-                                                             bool uncompensatedTextureAlpha,
-                                                             uint8_t* baseAlpha, uint8_t* overlayAlpha) {
+static inline __attribute__((always_inline)) void gfx_two_texture_blend_pass_alphas(
+    uint8_t surfaceAlpha, uint8_t mixAlpha, bool blendTextureAlpha,
+    bool uncompensatedTextureAlpha, uint8_t* baseAlpha, uint8_t* overlayAlpha) {
     uint32_t base;
     uint32_t overlay;
     uint32_t denominator;
+
+    /* Opaque geometry is by far the common case and all divisions collapse
+     * algebraically. Bottom of the Well's two-texture room materials take
+     * this path for every emitted vertex. */
+    if (surfaceAlpha == 0xFF) {
+        if (blendTextureAlpha) {
+            *baseAlpha = 255 - mixAlpha;
+            *overlayAlpha = uncompensatedTextureAlpha ? mixAlpha : (mixAlpha != 0 ? 0xFF : 0);
+        } else {
+            *baseAlpha = mixAlpha != 0xFF ? 0xFF : 0;
+            *overlayAlpha = mixAlpha;
+        }
+        return;
+    }
 
     if (blendTextureAlpha) {
         base = ((uint32_t)surfaceAlpha * (255 - mixAlpha) + 127) / 255;
@@ -1818,11 +1924,12 @@ static void gfx_texture_cache_clear(void) {
 }
 
 static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, const uint8_t *orig_addr,
-                                     uint32_t fmt, uint32_t siz, bool allocateOnMiss, bool* dynamicHit) {
+                                     uint32_t fmt, uint32_t siz, bool allocateOnMiss, bool* uploadInPlace) {
     size_t hash = (uintptr_t)orig_addr;
     struct TextureHashmapNode **node;
+    const struct TextureHashmapNode* previousNode = *n;
 
-    *dynamicHit = false;
+    *uploadInPlace = false;
 #if defined(TARGET_PSP)
     const TextureTileState* tileState = gfx_get_texture_tile(tile);
     const uint32_t source_span_size = gfx_texture_source_span_size(tile);
@@ -1838,7 +1945,6 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
 
     hash ^= (size_t)source_key * 2654435761U;
     hash ^= (size_t)palette_addr >> 4;
-    hash ^= (size_t)palette_key * 2246822519U;
 #else
     const bool dynamic_source = false;
 #endif
@@ -1858,20 +1964,50 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
             && (*node)->source_nibble_offset == rdp.loaded_texture[tile].source_nibble_offset
 #if defined(TARGET_PSP)
             && (*node)->source_key == source_key && (*node)->palette_addr == palette_addr
-            && (*node)->palette_key == palette_key && (*node)->mirror_s == mirror_s && (*node)->mirror_t == mirror_t
+            && (*node)->mirror_s == mirror_s && (*node)->mirror_t == mirror_t
 #endif
         ) {
-            *n = *node;
-            gfx_rapi->set_sampler_parameters(tile, (*node)->linear_filter, (*node)->cms, (*node)->cmt,
-                                             (*node)->masks, (*node)->maskt);
-            /* Dynamic sources are uploaded into the existing cache slot, so
-             * select it before texman_upload. Static hits are selected once by
-             * pipeline setup below instead of binding twice. */
-            if (dynamic_source) {
-                gfx_rapi->select_texture(tile, (*node)->texture_id);
-                *dynamicHit = true;
+#if defined(TARGET_PSP)
+            const bool paletteChanged = uses_palette && ((*node)->palette_key != palette_key);
+            const bool needsUpload = dynamic_source || paletteChanged;
+
+            /* The previous frame is complete before the next one starts, so
+             * its allocation can be overwritten safely. If the same palette
+             * address genuinely acquires two values during one GU list, keep
+             * separate entries so an earlier queued draw is not changed. */
+            if (paletteChanged && ((*node)->last_used_frame == sTextureCacheFrameSerial)) {
+                node = &(*node)->next;
+                continue;
             }
-            return !dynamic_source;
+#endif
+
+            *n = *node;
+            /* Sampler state belongs to the texture unit, not the texture
+             * allocation. Most scene textures share the same filter/wrap
+             * settings, so switching cache entries must not reissue an
+             * identical backend state change. */
+            if ((previousNode == NULL) ||
+                (previousNode->linear_filter != (*node)->linear_filter) ||
+                (previousNode->cms != (*node)->cms) || (previousNode->cmt != (*node)->cmt) ||
+                (previousNode->masks != (*node)->masks) || (previousNode->maskt != (*node)->maskt)) {
+                gfx_rapi->set_sampler_parameters(tile, (*node)->linear_filter, (*node)->cms, (*node)->cmt,
+                                                 (*node)->masks, (*node)->maskt);
+            }
+            /* Mutable source pixels and mutable palettes both update the
+             * existing allocation. Palette content is deliberately excluded
+             * from the bucket hash so animated TLUTs do not allocate one full
+             * converted texture per palette version and exhaust the cache. */
+#if defined(TARGET_PSP)
+            (*node)->last_used_frame = sTextureCacheFrameSerial;
+            if (needsUpload) {
+                (*node)->palette_key = palette_key;
+                gfx_rapi->select_texture(tile, (*node)->texture_id);
+                *uploadInPlace = true;
+            }
+            return !needsUpload;
+#else
+            return true;
+#endif
         }
         node = &(*node)->next;
     }
@@ -1911,6 +2047,7 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
     (*node)->source_key = source_key;
     (*node)->palette_addr = palette_addr;
     (*node)->palette_key = palette_key;
+    (*node)->last_used_frame = sTextureCacheFrameSerial;
     (*node)->upload_width = width;
     (*node)->upload_height = height;
     (*node)->mirror_s = mirror_s;
@@ -2416,13 +2553,14 @@ static void import_texture(int tile) {
     const TextureTileState* tileState = gfx_get_texture_tile(tile);
     uint8_t fmt = tileState->fmt;
     uint8_t siz = tileState->siz;
-    bool dynamicHit;
+    bool uploadInPlace;
 
     /* A cache entry was fully validated when it was created. Probe before the
      * more expensive source checks so repeated static display-list loads can
-     * reuse it immediately. Dynamic sources still fall through for upload. */
+     * reuse it immediately. Mutable sources and palettes still fall through
+     * for an upload into their existing allocation. */
     if (gfx_texture_cache_lookup(tile, &rendering_state.textures[tile], rdp.loaded_texture[tile].addr,
-                                 fmt, siz, false, &dynamicHit)) {
+                                 fmt, siz, false, &uploadInPlace)) {
         return;
     }
 
@@ -2431,9 +2569,9 @@ static void import_texture(int tile) {
     gfx_validate_texture_tile_dimensions(tile, "import_texture-dimensions");
 #endif
 
-    if (!dynamicHit) {
+    if (!uploadInPlace) {
         if (gfx_texture_cache_lookup(tile, &rendering_state.textures[tile], rdp.loaded_texture[tile].addr,
-                                     fmt, siz, true, &dynamicHit)) {
+                                     fmt, siz, true, &uploadInPlace)) {
             return;
         }
     }
@@ -2920,11 +3058,14 @@ static inline bool gfx_blend_cycle_preserves_color(uint32_t other_mode_l, uint32
 }
 
 static inline float gfx_texture_shift_scale(uint8_t shift) {
-    if (shift <= 10) {
-        return 1.0f / (float)(1U << shift);
-    }
+    static const float scales[16] = {
+        1.0f,       0.5f,       0.25f,      0.125f,
+        0.0625f,    0.03125f,   0.015625f,  0.0078125f,
+        0.00390625f, 0.001953125f, 0.0009765625f, 32.0f,
+        16.0f,      8.0f,       4.0f,       2.0f,
+    };
 
-    return (float)(1U << (16 - shift));
+    return scales[shift & 0xF];
 }
 
 static void gfx_prepare_texture_coord_state(struct TriPipelineState* state, int coordSlot, int textureSlot,
@@ -2944,12 +3085,17 @@ static void gfx_prepare_texture_coord_state(struct TriPipelineState* state, int 
         return;
     }
 
-    state->tex_u_scale[coordSlot] = shift_scale_s / state->tex_u_nominal_span[coordSlot];
-    state->tex_v_scale[coordSlot] = shift_scale_t / state->tex_v_nominal_span[coordSlot];
+    const float inv_nominal_span_u = 1.0f / state->tex_u_nominal_span[coordSlot];
+    const float inv_nominal_span_v = 1.0f / state->tex_v_nominal_span[coordSlot];
+
+    /* Reuse each reciprocal for scale and bias. PSP scalar floating-point
+     * division is expensive, and this state is rebuilt for every material. */
+    state->tex_u_scale[coordSlot] = shift_scale_s * inv_nominal_span_u;
+    state->tex_v_scale[coordSlot] = shift_scale_t * inv_nominal_span_v;
     state->tex_u_bias[coordSlot] =
-        (filter_bias - tileState->uls * 8.0f) / state->tex_u_nominal_span[coordSlot];
+        (filter_bias - tileState->uls * 8.0f) * inv_nominal_span_u;
     state->tex_v_bias[coordSlot] =
-        (filter_bias - tileState->ult * 8.0f) / state->tex_v_nominal_span[coordSlot];
+        (filter_bias - tileState->ult * 8.0f) * inv_nominal_span_v;
     state->tex_u_scale_to_primitive[coordSlot] = tileState->masks == G_TX_NOMASK;
     state->tex_v_scale_to_primitive[coordSlot] = tileState->maskt == G_TX_NOMASK;
 #if defined(TARGET_PSP)
@@ -2959,7 +3105,7 @@ static void gfx_prepare_texture_coord_state(struct TriPipelineState* state, int 
         const uint32_t tile_height = (tileState->lrt - tileState->ult + 4) / 4;
 
         if (texture_node != NULL && tile_width != 0 && tile_height != 0) {
-            if (texture_node->upload_width != 0) {
+            if ((texture_node->upload_width != 0) && (texture_node->upload_width != tile_width)) {
                 const float upload_width = texture_node->upload_width;
                 const float u_factor = (float)tile_width / upload_width;
 
@@ -2967,7 +3113,7 @@ static void gfx_prepare_texture_coord_state(struct TriPipelineState* state, int 
                 state->tex_u_bias[coordSlot] *= u_factor;
             }
 
-            if (texture_node->upload_height != 0) {
+            if ((texture_node->upload_height != 0) && (texture_node->upload_height != tile_height)) {
                 const float upload_height = texture_node->upload_height;
                 const float v_factor = (float)tile_height / upload_height;
 
@@ -3230,6 +3376,7 @@ static void gfx_prepare_tri_pipeline_state(void) {
     state->two_texture_blend = rdp.combine_two_texture_blend;
     state->two_texture_blend_uses_prim_lod = rdp.combine_two_texture_blend_uses_prim_lod;
     state->two_texture_alpha_blend = rdp.combine_two_texture_alpha_blend;
+    state->fog_uses_texture_alpha = use_fog && comb->uses_texture_alpha;
     state->flame_texture_atlas = flame_texture_atlas;
     state->texture_tint_colors_corrected = textureTintColorsCorrected;
     state->two_texture_uncompensated_alpha = twoTextureUncompensatedAlpha;
@@ -3474,12 +3621,11 @@ static void gfx_apply_modelview_matrix(void) {
 static GFX_DL_HANDLER void gfx_sp_matrix(uint8_t parameters, const int32_t *addr) {
     float matrix[4][4] __attribute__((aligned(16)));
 #if defined(TARGET_PSP)
-    const void* normalizedSource;
-
-    if (!gfx_normalize_read_source(addr, sizeof(Mtx), "matrix", &normalizedSource)) {
+    /* Command operands are resolved to native PSP addresses by seg_addr(). */
+    if (addr == NULL) {
+        gfx_log_bad_data_source("matrix", addr, sizeof(Mtx));
         return;
     }
-    addr = (const int32_t*)normalizedSource;
 #endif
 #ifndef GBI_FLOATS
     // Original GBI where fixed point matrices are used
@@ -3633,8 +3779,6 @@ static bool gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *verti
     const uint32_t geometryMode = rsp.geometry_mode;
     const uint8_t directionalLightCount = rsp.current_num_lights - 1;
 #if defined(TARGET_PSP)
-    const void* normalizedSource;
-
     if (n_vertices == 0) {
         return true;
     }
@@ -3644,10 +3788,11 @@ static bool gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *verti
         return false;
     }
 
-    if (!gfx_normalize_read_source(vertices, n_vertices * sizeof(Vtx), "vertex", &normalizedSource)) {
+    /* Command operands are resolved to native PSP addresses by seg_addr(). */
+    if (vertices == NULL) {
+        gfx_log_bad_data_source("vertex", vertices, n_vertices * sizeof(Vtx));
         return false;
     }
-    vertices = (const Vtx*)normalizedSource;
 
     {
         const struct GfxVfpuTransformState transformState = {
@@ -3779,8 +3924,26 @@ static bool gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *verti
     return true;
 }
 
+static bool gfx_sp_cull_display_list(uint32_t firstVertex, uint32_t lastVertex) {
+    uint8_t commonClipPlanes = CLIP_TEST_FLAGS;
+
+    if ((firstVertex >= MAX_VERTICES) || (lastVertex >= MAX_VERTICES) ||
+        (firstVertex > lastVertex)) {
+        return false;
+    }
+
+    /* G_CULLDL ends the current display list when every bounding-volume
+     * vertex lies outside the same side of the view frustum. SPVertex has
+     * already recorded those six homogeneous clip-plane tests in clip_rej. */
+    for (uint32_t i = firstVertex; i <= lastVertex; i++) {
+        commonClipPlanes &= rsp.loaded_vertices[i].clip_rej;
+    }
+
+    return commonClipPlanes != 0;
+}
+
 #if defined(TARGET_PSP) && defined(F3DEX_GBI_2)
-static inline void *seg_addr(uintptr_t w1);
+static __attribute__((noinline, no_instrument_function)) void *seg_addr(uintptr_t w1);
 
 static bool gfx_decode_vertex_cmd_f3dex2(uint32_t w0, uint32_t* n, uint32_t* destIndex) {
     const uint32_t count = (w0 >> 12) & 0xFF;
@@ -3940,7 +4103,7 @@ static void gfx_sp_triangles(uint32_t packed0, uint32_t packed1, uint8_t triangl
     size_t clipped_vertices_num = 3;
     /* A triangle clipped against six planes can become a nine-vertex polygon. */
     if (clip_flags & CLIP_TEST_FLAGS) {
-        gfx_clip_single_vert(sClippedVertices, &clipped_vertices_num, v_arr);
+        gfx_clip_single_vert(sClippedVertices, &clipped_vertices_num, v_arr, clip_flags);
 
         if (!clipped_vertices_num) {
             /* No idea if this is possible */
@@ -4074,10 +4237,9 @@ static void gfx_sp_triangles(uint32_t packed0, uint32_t packed1, uint8_t triangl
             buf_vbo_tex1[buf_num_vert].alpha = overlayAlpha;
         }
         if (state->use_fog) {
-            psp_fog_t *fogOut = &buf_vbo_fog[buf_num_vert];
+            struct RGBA fogColor = rdp.fog_color;
 
-            fogOut->color = rdp.fog_color;
-            fogOut->color.a = gfx_color_mul_channel(vertex->fog_alpha, surfaceAlpha);
+            fogColor.a = gfx_color_mul_channel(vertex->fog_alpha, surfaceAlpha);
             if (state->two_texture_blend && state->two_texture_alpha_blend) {
                 uint8_t baseAlpha;
                 uint8_t overlayAlpha;
@@ -4085,17 +4247,29 @@ static void gfx_sp_triangles(uint32_t packed0, uint32_t packed1, uint8_t triangl
                                              ? rdp.prim_lod_frac
                                              : rdp.env_color.a;
 
-                gfx_two_texture_blend_pass_alphas(fogOut->color.a, mixAlpha, true,
+                gfx_two_texture_blend_pass_alphas(fogColor.a, mixAlpha, true,
                                                   state->two_texture_uncompensated_alpha, &baseAlpha,
                                                   &overlayAlpha);
-                fogOut->color.a = baseAlpha;
+                fogColor.a = baseAlpha;
                 buf_vbo_fog_tex1_alpha[buf_num_vert] = overlayAlpha;
             }
-            fogOut->u = out->u;
-            fogOut->v = out->v;
-            fogOut->x = vertex->x;
-            fogOut->y = vertex->y;
-            fogOut->z = vertex->z;
+            if (state->fog_uses_texture_alpha) {
+                psp_fog_textured_t* fogOut = &buf_vbo_fog.textured[buf_num_vert];
+
+                fogOut->u = out->u;
+                fogOut->v = out->v;
+                fogOut->color = fogColor;
+                fogOut->x = vertex->x;
+                fogOut->y = vertex->y;
+                fogOut->z = vertex->z;
+            } else {
+                psp_fog_color_t* fogOut = &buf_vbo_fog.color[buf_num_vert];
+
+                fogOut->color = fogColor;
+                fogOut->x = vertex->x;
+                fogOut->y = vertex->y;
+                fogOut->z = vertex->z;
+            }
         }
         if (shader_program_id == 0x01A00045) {
             /* Matches the old code, which only updated the temporary pointer after the copy. */
@@ -4113,6 +4287,46 @@ static void gfx_sp_triangles(uint32_t packed0, uint32_t packed1, uint8_t triangl
 #undef GFX_TRI_INDEX_DIVISOR
 
 /* This will be going away possibly, it all depends on how we end up treating hw sprites */
+#if defined(TARGET_PSP)
+static inline void gfx_normalize_2d_repeat_axis(short* first, short* second, uint8_t cm, uint8_t mask,
+                                                uint16_t period) {
+    int32_t minimum;
+    int32_t maximum;
+    int32_t offset;
+
+    /* Match the backend's sampler choice: a zero mask or CLAMP selects GU_CLAMP. */
+    if ((cm & G_TX_CLAMP) || mask == G_TX_NOMASK || period == 0) {
+        return;
+    }
+
+    minimum = *first < *second ? *first : *second;
+    if (minimum >= 0) {
+        return;
+    }
+
+    maximum = *first > *second ? *first : *second;
+    offset = ((-minimum + period - 1) / period) * period;
+    if (maximum + offset > INT16_MAX) {
+        return;
+    }
+
+    *first += offset;
+    *second += offset;
+}
+
+static inline void gfx_normalize_2d_repeat_uvs(VertexColor vertices[2], const TextureTileState* tileState,
+                                                const struct TextureHashmapNode* texture) {
+    if (texture == NULL) {
+        return;
+    }
+
+    gfx_normalize_2d_repeat_axis(&vertices[0].u, &vertices[1].u, tileState->cms, tileState->masks,
+                                 texture->upload_width);
+    gfx_normalize_2d_repeat_axis(&vertices[0].v, &vertices[1].v, tileState->cmt, tileState->maskt,
+                                 texture->upload_height);
+}
+#endif
+
 static void gfx_sp_tri1_2d(uint8_t vtx1_idx, uint8_t vtx2_idx, UNUSED uint8_t vtx3_idx) {
     struct VertexColor *v1 = &rsp.loaded_vertices_2D[vtx1_idx];
     struct VertexColor *v2 = &rsp.loaded_vertices_2D[vtx2_idx];
@@ -4125,6 +4339,11 @@ static void gfx_sp_tri1_2d(uint8_t vtx1_idx, uint8_t vtx2_idx, UNUSED uint8_t vt
     const bool use_texture = state->use_texture;
     const int texture_tile = state->two_texture_blend ? 0 : (comb->active_texture >= 0 ? comb->active_texture : 0);
     const TextureTileState* tileState = gfx_get_texture_tile(texture_tile);
+#if defined(TARGET_PSP)
+    const bool twoTextureBlend =
+        state->two_texture_blend && rendering_state.textures[0] != NULL && rendering_state.textures[1] != NULL;
+    uint8_t secondPassAlpha[2] = { 0 };
+#endif
     //uint32_t tex_width = (tileState->lrs - tileState->uls + 4) / 4;
     //uint32_t tex_height = (tileState->lrt - tileState->ult + 4) / 4;
 
@@ -4189,9 +4408,59 @@ static void gfx_sp_tri1_2d(uint8_t vtx1_idx, uint8_t vtx2_idx, UNUSED uint8_t vt
             tri_buf[tri_num_vert].color.a =
                 gfx_color_mul_channel(tri_buf[tri_num_vert].color.a, rdp.env_color.a);
         }
+#if defined(TARGET_PSP)
+        if (twoTextureBlend) {
+            uint8_t baseAlpha;
+            const uint8_t mixAlpha = state->two_texture_blend_uses_prim_lod
+                                         ? rdp.prim_lod_frac
+                                         : rdp.env_color.a;
+
+            gfx_two_texture_blend_pass_alphas(tri_buf[tri_num_vert].color.a, mixAlpha,
+                                              state->two_texture_alpha_blend,
+                                              state->two_texture_uncompensated_alpha, &baseAlpha,
+                                              &secondPassAlpha[tri_num_vert]);
+            tri_buf[tri_num_vert].color.a = baseAlpha;
+        }
+#endif
         tri_num_vert++;
     }
+
+#if defined(TARGET_PSP)
+    if (use_texture && rendering_state.textures[texture_tile] != NULL) {
+        gfx_normalize_2d_repeat_uvs(tri_buf, tileState, rendering_state.textures[texture_tile]);
+    }
+
+    if (use_texture && !state->flame_texture_atlas && rendering_state.textures[texture_tile] != NULL) {
+        rendering_state.textures[texture_tile]->last_used_frame = sTextureCacheFrameSerial;
+        if (twoTextureBlend) {
+            rendering_state.textures[1]->last_used_frame = sTextureCacheFrameSerial;
+            gfx_rapi->set_use_alpha(true);
+        }
+    }
+#endif
     gfx_scegu_draw_triangles_2d((float*)&tri_buf[0],0,1);
+#if defined(TARGET_PSP)
+    if (twoTextureBlend) {
+        const TextureTileState* tile1State = gfx_get_texture_tile(1);
+        const float shiftScaleS = gfx_texture_shift_scale(tile1State->shifts);
+        const float shiftScaleT = gfx_texture_shift_scale(tile1State->shiftt);
+
+        for (int i = 0; i < 2; i++) {
+            tri_buf[i].u = ((v_arr[i]->u * shiftScaleS) - tile1State->uls * 8) / 32;
+            tri_buf[i].v = ((v_arr[i]->v * shiftScaleT) - tile1State->ult * 8) / 32;
+            tri_buf[i].color.a = secondPassAlpha[i];
+        }
+
+        gfx_normalize_2d_repeat_uvs(tri_buf, tile1State, rendering_state.textures[1]);
+
+        gfx_rapi->select_texture(1, rendering_state.textures[1]->texture_id);
+        gfx_scegu_draw_triangles_2d((float*)&tri_buf[0], 0, 1);
+        gfx_rapi->set_use_alpha(rendering_state.alpha_blend);
+        gfx_rapi->select_texture(0, rendering_state.textures[0]->texture_id);
+        rendering_state.bound_texture_id = rendering_state.textures[0]->texture_id;
+        rendering_state.bound_texture_tile = 0;
+    }
+#endif
 }
 
 static void gfx_sp_geometry_mode(uint32_t clear, uint32_t set) {
@@ -4206,9 +4475,9 @@ static void gfx_sp_geometry_mode(uint32_t clear, uint32_t set) {
 
 static void gfx_calc_and_set_viewport(const Vp_t *viewport) {
 #if defined(TARGET_PSP)
-    const void* normalizedSource;
-
-    if (!gfx_normalize_read_source(viewport, sizeof(Vp_t), "viewport", &normalizedSource)) {
+    /* Command operands are resolved to native PSP addresses by seg_addr(). */
+    if (viewport == NULL) {
+        gfx_log_bad_data_source("viewport", viewport, sizeof(Vp_t));
         rdp.viewport.x = 0;
         rdp.viewport.y = 0;
         rdp.viewport.width = gfx_current_dimensions.width;
@@ -4218,7 +4487,6 @@ static void gfx_calc_and_set_viewport(const Vp_t *viewport) {
         gfx_mark_tri_pipeline_dirty();
         return;
     }
-    viewport = (const Vp_t*)normalizedSource;
 #endif
 
     // 2 bits fraction
@@ -4266,12 +4534,11 @@ static void gfx_sp_movemem(uint8_t index, uint8_t offset, const void* data) {
             int lightidx = offset / 24 - 2;
             if (lightidx >= 0 && lightidx <= MAX_LIGHTS) { // skip lookat
 #if defined(TARGET_PSP)
-                const void* normalizedSource;
-
-                if (!gfx_normalize_read_source(data, sizeof(Light_t), "light", &normalizedSource)) {
+                /* Command operands are resolved to native PSP addresses by seg_addr(). */
+                if (data == NULL) {
+                    gfx_log_bad_data_source("light", data, sizeof(Light_t));
                     break;
                 }
-                data = normalizedSource;
 #endif
                 // NOTE: reads out of bounds if it is an ambient light
                 memcpy(rsp.current_lights + lightidx, data, sizeof(Light_t));
@@ -4284,12 +4551,11 @@ static void gfx_sp_movemem(uint8_t index, uint8_t offset, const void* data) {
         case G_MV_L2:
 #if defined(TARGET_PSP)
         {
-            const void* normalizedSource;
-
-            if (!gfx_normalize_read_source(data, sizeof(Light_t), "light", &normalizedSource)) {
+            /* Command operands are resolved to native PSP addresses by seg_addr(). */
+            if (data == NULL) {
+                gfx_log_bad_data_source("light", data, sizeof(Light_t));
                 break;
             }
-            data = normalizedSource;
         }
 #endif
             // NOTE: reads out of bounds if it is an ambient light
@@ -4478,10 +4744,11 @@ static bool gfx_loaded_texture_matches_static_cache(int loadSlot, const uint8_t*
                                                     uint32_t rowStrideBytes, uint8_t sourceNibbleOffset) {
     const struct TextureHashmapNode* node = rendering_state.textures[loadSlot];
     const bool usesPalette = rdp.texture_to_load.fmt == G_IM_FMT_CI;
-    const uint32_t sourceKey = OotPsp_GetExternalAssetRangeSerial(sourceAddr, sourceSizeBytes);
 
-    if (rdp.textures_changed[loadSlot] || (node == NULL) || (sourceKey == 0) ||
-        (node->source_key != sourceKey) ||
+    /* Reject mismatched state before the comparatively expensive asset-range
+     * serial lookup. Most load commands that genuinely change a texture fail
+     * one of these cheap comparisons. */
+    if (rdp.textures_changed[loadSlot] || (node == NULL) ||
         (node->texture_addr != sourceAddr) || (node->fmt != rdp.texture_to_load.fmt) ||
         (node->siz != rdp.texture_to_load.siz) ||
         (rdp.loaded_texture[loadSlot].addr != sourceAddr) ||
@@ -4489,6 +4756,12 @@ static bool gfx_loaded_texture_matches_static_cache(int loadSlot, const uint8_t*
         (rdp.loaded_texture[loadSlot].source_size_bytes != sourceSizeBytes) ||
         (rdp.loaded_texture[loadSlot].row_stride_bytes != rowStrideBytes) ||
         (rdp.loaded_texture[loadSlot].source_nibble_offset != sourceNibbleOffset)) {
+        return false;
+    }
+
+    const uint32_t sourceKey = OotPsp_GetExternalAssetRangeSerial(sourceAddr, sourceSizeBytes);
+
+    if ((sourceKey == 0) || (node->source_key != sourceKey)) {
         return false;
     }
 
@@ -4785,6 +5058,11 @@ static bool gfx_cc_is_combined_mul_shade(uint32_t a, uint32_t b, uint32_t c, uin
            (d == G_ACMUX_0);
 }
 
+static bool gfx_cc_is_combined_mul_environment(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    return (a == G_ACMUX_COMBINED) && (b == G_ACMUX_0) && (c == G_ACMUX_ENVIRONMENT) &&
+           (d == G_ACMUX_0);
+}
+
 static bool gfx_cc_is_two_texture_prim_lod_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
                                                 uint32_t rgbD0, uint32_t alphaA0, uint32_t alphaB0,
                                                 uint32_t alphaC0, uint32_t alphaD0, uint32_t rgbA1,
@@ -4798,6 +5076,33 @@ static bool gfx_cc_is_two_texture_prim_lod_tint(uint32_t rgbA0, uint32_t rgbB0, 
            (rgbA1 == G_CCMUX_PRIMITIVE) && (rgbB1 == G_CCMUX_ENVIRONMENT) &&
            (rgbC1 == G_CCMUX_COMBINED) && (rgbD1 == G_CCMUX_ENVIRONMENT) &&
            gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1);
+}
+
+static bool gfx_cc_is_two_texture_crossfade_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
+                                                  uint32_t rgbD0, uint32_t alphaA0, uint32_t alphaB0,
+                                                  uint32_t alphaC0, uint32_t alphaD0, uint32_t rgbA1,
+                                                  uint32_t rgbB1, uint32_t rgbC1, uint32_t rgbD1,
+                                                  uint32_t alphaA1, uint32_t alphaB1, uint32_t alphaC1,
+                                                  uint32_t alphaD1) {
+    const bool rgbCrossfade =
+        (rgbA0 == G_CCMUX_TEXEL1) && (rgbB0 == G_CCMUX_TEXEL0) &&
+        ((rgbC0 == G_CCMUX_PRIM_LOD_FRAC) || (rgbC0 == G_CCMUX_ENV_ALPHA) ||
+         (rgbC0 == G_CCMUX_LOD_FRACTION)) &&
+        (rgbD0 == G_CCMUX_TEXEL0);
+    const bool alphaCrossfade =
+        (alphaA0 == G_ACMUX_TEXEL1) && (alphaB0 == G_ACMUX_TEXEL0) &&
+        ((alphaC0 == G_ACMUX_PRIM_LOD_FRAC) || (alphaC0 == G_ACMUX_ENVIRONMENT) ||
+         (alphaC0 == G_ACMUX_LOD_FRACTION)) &&
+        (alphaD0 == G_ACMUX_TEXEL0);
+    const bool colorTint =
+        (rgbA1 == G_CCMUX_PRIMITIVE) && (rgbB1 == G_CCMUX_ENVIRONMENT) &&
+        (rgbC1 == G_CCMUX_COMBINED) && (rgbD1 == G_CCMUX_ENVIRONMENT);
+    const bool alphaModulated =
+        gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1) ||
+        gfx_cc_is_combined_mul_shade(alphaA1, alphaB1, alphaC1, alphaD1) ||
+        gfx_cc_is_combined_mul_environment(alphaA1, alphaB1, alphaC1, alphaD1);
+
+    return rgbCrossfade && alphaCrossfade && colorTint && alphaModulated;
 }
 
 static bool gfx_cc_is_two_texture_self_modulated_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
@@ -4839,18 +5144,20 @@ static bool gfx_cc_is_single_texture_prim_lod_tint(uint32_t rgbA0, uint32_t rgbB
            (rgbC1 == G_CCMUX_COMBINED) && (rgbD1 == G_CCMUX_ENVIRONMENT);
 }
 
-static bool gfx_cc_is_single_texture_env_alpha_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
-                                                    uint32_t rgbD0, uint32_t rgbA1, uint32_t rgbB1,
-                                                    uint32_t rgbC1, uint32_t rgbD1) {
-    return (rgbA0 == G_CCMUX_TEXEL0) && (rgbB0 == G_CCMUX_PRIMITIVE) &&
+static bool gfx_cc_is_standalone_heart_tint(uint32_t rgbA0, uint32_t rgbB0, uint32_t rgbC0,
+                                            uint32_t rgbD0, uint32_t alphaA0, uint32_t alphaB0,
+                                            uint32_t alphaC0, uint32_t alphaD0, uint32_t rgbA1,
+                                            uint32_t rgbB1, uint32_t rgbC1, uint32_t rgbD1,
+                                            uint32_t alphaA1, uint32_t alphaB1, uint32_t alphaC1,
+                                            uint32_t alphaD1) {
+    return (alphaA0 == G_ACMUX_0) && (alphaB0 == G_ACMUX_0) &&
+           (alphaC0 == G_ACMUX_0) && (alphaD0 == G_ACMUX_TEXEL0) &&
+           (alphaA1 == G_ACMUX_0) && (alphaB1 == G_ACMUX_0) &&
+           (alphaC1 == G_ACMUX_0) && (alphaD1 == G_ACMUX_COMBINED) &&
+           (rgbA0 == G_CCMUX_TEXEL0) && (rgbB0 == G_CCMUX_PRIMITIVE) &&
            (rgbC0 == G_CCMUX_ENV_ALPHA) && (rgbD0 == G_CCMUX_TEXEL0) &&
            (rgbA1 == G_CCMUX_PRIMITIVE) && (rgbB1 == G_CCMUX_ENVIRONMENT) &&
            (rgbC1 == G_CCMUX_COMBINED) && (rgbD1 == G_CCMUX_ENVIRONMENT);
-}
-
-static bool gfx_cc_is_combined_mul_environment(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
-    return (a == G_ACMUX_COMBINED) && (b == G_ACMUX_0) && (c == G_ACMUX_ENVIRONMENT) &&
-           (d == G_ACMUX_0);
 }
 
 static void gfx_dp_set_combine_mode(uint32_t rgb, uint32_t alpha, bool color_mul_env, bool color_mul_prim,
@@ -5016,6 +5323,39 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
         twoTextureAlphaBlend = true;
     }
 
+    if (gfx_cc_is_two_texture_crossfade_tint(rgbA0, rgbB0, rgbC0, rgbD0, alphaA0, alphaB0,
+                                             alphaC0, alphaD0, rgbA1, rgbB1, rgbC1, rgbD1,
+                                             alphaA1, alphaB1, alphaC1, alphaD1)) {
+        /* Sandstorms and several weather/magic/item materials crossfade two independently scrolling maps,
+         * then tint the result between ENVIRONMENT and PRIMITIVE. The compact combiner previously retained
+         * TEXEL0 but silently discarded TEXEL1. Reuse the shared two-pass path and canonicalize each pass to
+         * the texture currently bound by that path. */
+        rgbComb = color_comb(G_CCMUX_TEXEL0, G_CCMUX_0, G_CCMUX_PRIMITIVE, G_CCMUX_0);
+        if (gfx_cc_is_combined_mul_primitive(alphaA1, alphaB1, alphaC1, alphaD1)) {
+            alphaComb = color_comb(G_ACMUX_TEXEL0, G_ACMUX_0, G_ACMUX_PRIMITIVE, G_ACMUX_0);
+        } else if (gfx_cc_is_combined_mul_shade(alphaA1, alphaB1, alphaC1, alphaD1)) {
+            alphaComb = color_comb(G_ACMUX_TEXEL0, G_ACMUX_0, G_ACMUX_SHADE, G_ACMUX_0);
+        } else {
+            alphaComb = color_comb(G_ACMUX_0, G_ACMUX_0, G_ACMUX_0, G_ACMUX_TEXEL0);
+            alphaMulEnv = true;
+        }
+        textureBlend = true;
+        twoTextureBlend = true;
+        /* LOD_FRACTION materials program PRIM_LOD_FRAC as their fixed PSP fallback, matching the existing
+         * two-texture path. ENV_ALPHA remains the alternate animated crossfade source. */
+        twoTextureBlendUsesPrimLod = rgbC0 != G_CCMUX_ENV_ALPHA;
+
+        /*
+         * The sandstorm crossfades its RGB with PRIM_LOD_FRAC, but its alpha
+         * with ENV_ALPHA. Its TEXEL1 (IA8) layer is fully opaque, whereas the
+         * usual two-texture alpha compensation below assumes TEXEL0 is the
+         * opaque layer. Use ordinary source-over weights for this material so
+         * the second pass adds haze instead of replacing the scene.
+         */
+        twoTextureAlphaBlend =
+            !((rgbC0 == G_CCMUX_PRIM_LOD_FRAC) && (alphaC0 == G_ACMUX_ENVIRONMENT));
+    }
+
     if (gfx_cc_is_two_texture_self_modulated_tint(rgbA0, rgbB0, rgbC0, rgbD0, alphaA0, alphaB0,
                                                    alphaC0, alphaD0, rgbA1, rgbB1, rgbC1, rgbD1,
                                                    alphaA1, alphaB1, alphaC1, alphaD1)) {
@@ -5046,10 +5386,13 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
     singleTexturePrimLodTint =
         gfx_cc_is_single_texture_prim_lod_tint(rgbA0, rgbB0, rgbC0, rgbD0, rgbA1, rgbB1, rgbC1,
                                                rgbD1);
-    /* The freestanding Piece of Heart crystal uses ENV_ALPHA for the equivalent single-texture first cycle. */
+    /* The freestanding Piece of Heart crystal uses ENV_ALPHA for the equivalent single-texture first cycle.
+     * Include its alpha cycles in the match: several unrelated I8 materials share the RGB cycles, and running
+     * their textures through the statistical tint correction adds avoidable work to the display-list hot path. */
     singleTextureEnvAlphaTint =
-        gfx_cc_is_single_texture_env_alpha_tint(rgbA0, rgbB0, rgbC0, rgbD0, rgbA1, rgbB1, rgbC1,
-                                                rgbD1);
+        gfx_cc_is_standalone_heart_tint(rgbA0, rgbB0, rgbC0, rgbD0, alphaA0, alphaB0, alphaC0,
+                                        alphaD0, rgbA1, rgbB1, rgbC1, rgbD1, alphaA1, alphaB1,
+                                        alphaC1, alphaD1);
 
     flameTextureAtlas =
         ((rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE) &&
@@ -5634,7 +5977,7 @@ static bool gfx_validate_dl_cursor(uintptr_t raw, Gfx** cmdP) {
         return false;
     }
 
-    cacheIndex = (normalized >> 3) & (GFX_VALIDATED_POINTER_CACHE_SIZE - 1);
+    cacheIndex = (normalized >> 3) & (GFX_VALIDATED_DL_CURSOR_CACHE_SIZE - 1);
     if (sValidatedDlCursorCache[cacheIndex] == normalized) {
         *cmdP = (Gfx*)normalized;
         return true;
@@ -5663,7 +6006,7 @@ static inline void* gfx_runtime_symbol_addr(uintptr_t addr) {
     }
 }
 
-static inline void *seg_addr(uintptr_t w1) {
+static __attribute__((noinline)) void *gfx_resolve_segmented_address_slow(uintptr_t w1) {
     void* runtimeSymbol = gfx_runtime_symbol_addr(w1);
 
     if (runtimeSymbol != NULL) {
@@ -5684,7 +6027,7 @@ static inline void *seg_addr(uintptr_t w1) {
             if (!gfx_addr_is_native(baseValue) && gfx_addr_looks_segmented(baseValue) &&
                 gfx_addr_looks_segmented(translatedValue) &&
                 (translatedValue != w1)) {
-                translated = seg_addr(translatedValue);
+                translated = gfx_resolve_segmented_address_slow(translatedValue);
                 if (translated != (void*)translatedValue) {
                     gfx_log_segment_translation(w1, rsp.segments[segment], translated);
                     return translated;
@@ -5719,6 +6062,7 @@ static inline void *seg_addr(uintptr_t w1) {
 #endif
 
         gfx_log_unmapped_segment(w1);
+        return NULL;
     }
 
     {
@@ -5729,7 +6073,67 @@ static inline void *seg_addr(uintptr_t w1) {
         }
     }
 
-    return (void*)w1;
+    return NULL;
+}
+
+static __attribute__((noinline, no_instrument_function)) void *seg_addr(uintptr_t w1) {
+#if defined(TARGET_PSP)
+    uint8_t segment = w1 >> 24;
+    uintptr_t rspBase = 0;
+    uintptr_t globalBase = 0;
+    uintptr_t mappingBase;
+    size_t cacheIndex;
+    GfxSegmentAddressCacheEntry* entry;
+    void* resolved;
+
+    /* D_01000000 is a native linker symbol used as a stand-in for segment 1,
+     * so its result follows segment 1 rather than the pointer's numeric high
+     * byte. All other operands depend only on their own possible segment. */
+    if (w1 == (uintptr_t)&D_01000000) {
+        rspBase = (uintptr_t)rsp.segments[1];
+        globalBase = gSegments[1];
+    } else if ((segment != 0) && (segment < NUM_SEGMENTS)) {
+        rspBase = (uintptr_t)rsp.segments[segment];
+        if (rspBase == 0) {
+            globalBase = gSegments[segment];
+        }
+    }
+
+    /* Object display lists reuse small operands such as 0x06000000 with many
+     * different segment bases. Hashing only the operand made every object
+     * evict the previous object's resolution from the same direct-mapped
+     * slot. Include the selected base so those mappings occupy independent
+     * cache lines. */
+    mappingBase = rspBase != 0 ? rspBase : globalBase;
+    cacheIndex = ((w1 >> 3) ^ (w1 >> 13) ^ (mappingBase >> 4) ^ (mappingBase >> 15)) &
+                 (GFX_SEGMENT_ADDRESS_CACHE_SIZE - 1);
+    entry = &sSegmentAddressCache[cacheIndex];
+    if (__builtin_expect((entry->raw == w1) && (entry->rspBase == rspBase) &&
+                         (entry->globalBase == globalBase), 1)) {
+        return entry->resolved;
+    }
+
+    resolved = gfx_resolve_segmented_address_slow(w1);
+
+    /* A segment base may itself be segmented. Those uncommon chained maps
+     * depend on another segment too, so leave them to the compatibility path
+     * instead of caching an incomplete dependency. Native and direct global
+     * mappings are stable until the bases recorded above change. */
+    uint8_t rspBaseSegment = rspBase >> 24;
+    bool chainedRspBase = (rspBase != 0) && !gfx_addr_is_native(rspBase) &&
+                          (rspBaseSegment != 0) && (rspBaseSegment < NUM_SEGMENTS);
+
+    if (!chainedRspBase) {
+        entry->raw = w1;
+        entry->rspBase = rspBase;
+        entry->globalBase = globalBase;
+        entry->resolved = resolved;
+    }
+
+    return resolved;
+#else
+    return gfx_resolve_segmented_address_slow(w1);
+#endif
 }
 
 #if defined(TARGET_PSP) && defined(F3DEX_GBI_2)
@@ -5915,7 +6319,6 @@ static uint32_t gfx_s2dex_bg_texcoord_span(uint32_t frameSpan, uint16_t scale, b
 }
 
 static GFX_DL_HANDLER void gfx_sp_s2dex_bg_rect(uint32_t opcode, const void* bgAddr) {
-    const void* normalizedBg;
     const uObjBg* bg;
     const uint8_t* source;
     uint32_t imageWidth;
@@ -5944,16 +6347,18 @@ static GFX_DL_HANDLER void gfx_sp_s2dex_bg_rect(uint32_t opcode, const void* bgA
     bool savedTextureTintUsesEnvAlpha;
     const bool scaled = opcode == G_BG_1CYC;
 
-    if (!gfx_normalize_read_source(bgAddr, sizeof(uObjBg), "s2dex-bg", &normalizedBg)) {
+    /* Command operands are resolved to native PSP addresses by seg_addr(). */
+    if (bgAddr == NULL) {
+        gfx_log_bad_data_source("s2dex-bg", bgAddr, sizeof(uObjBg));
         return;
     }
 
-    if (((uintptr_t)normalizedBg & (sizeof(uint32_t) - 1)) != 0) {
+    if (((uintptr_t)bgAddr & (sizeof(uint32_t) - 1)) != 0) {
         gfx_log_bad_data_source("s2dex-bg-align", bgAddr, sizeof(uObjBg));
         return;
     }
 
-    bg = (const uObjBg*)normalizedBg;
+    bg = (const uObjBg*)bgAddr;
     imageWidth = bg->b.imageW >> 2;
     imageHeight = bg->b.imageH >> 2;
     source = (const uint8_t*)seg_addr((uintptr_t)bg->b.imagePtr);
@@ -6140,6 +6545,33 @@ static void gfx_run_dl(Gfx* cmd) {
                 }
 #endif
                 break;
+            case (uint8_t)G_CULLDL:
+            {
+                uint32_t firstVertex;
+                uint32_t lastVertex;
+
+#if defined(F3DEX_GBI_2) || defined(F3DEX_GBI) || defined(F3DLP_GBI)
+                firstVertex = C0(0, 16) / 2;
+                lastVertex = C1(0, 16) / 2;
+#else
+                const uint32_t endOffset = C1(0, 16) / 40;
+
+                firstVertex = C0(0, 16) / 40;
+                if (endOffset == 0) {
+                    break;
+                }
+                lastVertex = endOffset - 1;
+#endif
+
+                if (gfx_sp_cull_display_list(firstVertex, lastVertex)) {
+                    if (returnDepth == 0) {
+                        return;
+                    }
+                    cmd = returnStack[--returnDepth];
+                    continue;
+                }
+                break;
+            }
             case G_DL:
             {
                 Gfx* target = (Gfx*)seg_addr(cmd->words.w1);
@@ -6434,6 +6866,10 @@ struct GfxRenderingAPI *gfx_get_current_rendering_api(void) {
 void gfx_start_frame(void) {
     //sceIoWrite(1, "----START FRAME!\n", 18);
 #if defined(TARGET_PSP)
+    sTextureCacheFrameSerial++;
+    if (sTextureCacheFrameSerial == 0) {
+        sTextureCacheFrameSerial = 1;
+    }
 #if defined(OOTDEBUG)
     sPerformanceCommandCount = 0;
     sPerformanceInputTriangleCount = 0;

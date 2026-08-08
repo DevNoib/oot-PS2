@@ -239,6 +239,14 @@ typedef struct FogVertex {
     float x, y, z;
 } FogVertex;
 
+typedef struct FogColorVertex {
+    unsigned int color;
+    float x, y, z;
+} FogColorVertex;
+
+typedef char FogVertex_size_check[(sizeof(FogVertex) == 24) ? 1 : -1];
+typedef char FogColorVertex_size_check[(sizeof(FogColorVertex) == 16) ? 1 : -1];
+
 typedef struct VertexColor {
     unsigned short a, b;
     unsigned long color;
@@ -1198,18 +1206,18 @@ static void gfx_scegu_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len,
     sceGuDrawArray(GU_TRIANGLES, GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 3 * buf_vbo_num_tris, 0, buf);
 }
 
-static void gfx_scegu_draw_fog_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len,
-                                         size_t buf_vbo_num_tris) {
+static void gfx_scegu_draw_fog_triangles(float buf_vbo[], size_t buf_vbo_len,
+                                         size_t buf_vbo_num_tris, bool useTextureAlpha,
+                                         bool restoreShaderState) {
     struct ShaderProgram *restoreShader = sAppliedShader;
-    const bool useTextureAlpha = restoreShader != NULL &&
-                                 (restoreShader->texture_used[0] || restoreShader->texture_used[1]) &&
-                                 gfx_scegu_shader_uses_texture_alpha(restoreShader);
     const size_t vertexCount = 3 * buf_vbo_num_tris;
+    const int vertexFormat = (useTextureAlpha ? GU_TEXTURE_32BITF : 0) |
+                             GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D;
 
-    gfx_scegu_reserve_list_memory(sizeof(FogVertex) * vertexCount);
-    void *buf = sceGuGetMemory(sizeof(FogVertex) * vertexCount);
+    gfx_scegu_reserve_list_memory(buf_vbo_len);
+    void *buf = sceGuGetMemory(buf_vbo_len);
 
-    OotPsp_MemcpyVfpu(buf, buf_vbo, sizeof(FogVertex) * vertexCount);
+    OotPsp_MemcpyVfpu(buf, buf_vbo, buf_vbo_len);
 
     /* N64 fog is an RDP blend after texture/color combining. Re-draw the same
      * geometry as fog RGB with the VFPU-computed shade alpha. */
@@ -1232,8 +1240,14 @@ static void gfx_scegu_draw_fog_triangles(float buf_vbo[], UNUSED size_t buf_vbo_
     }
     sceGuEnable(GU_BLEND);
     sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
-    sceGuDrawArray(GU_TRIANGLES, GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D,
-                   vertexCount, 0, buf);
+    sceGuDrawArray(GU_TRIANGLES, vertexFormat, vertexCount, 0, buf);
+
+    /* A two-texture material emits its two fog contributions back-to-back.
+     * Keep the fog state live between them instead of restoring and then
+     * immediately rebuilding it for the second pass. */
+    if (!restoreShaderState) {
+        return;
+    }
 
     sceGuDepthFunc(GU_GEQUAL);
     sceGuDepthMask(sDepthWriteEnabled ? GU_FALSE : GU_TRUE);

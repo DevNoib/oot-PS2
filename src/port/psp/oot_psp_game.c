@@ -147,7 +147,7 @@ static RegEditor sRegEditor;
 RegEditor* gRegEditor = &sRegEditor;
 
 static PreNmiBuff sPspPreNmiBuffer;
-static u8 sPspSystemHeap[4 * 1024 * 1024] __attribute__((aligned(64)));
+u8 gOotPspSystemHeap[OOT_PSP_SYSTEM_HEAP_SIZE] __attribute__((aligned(64)));
 static u8 sPspSram[SRAM_SIZE] __attribute__((aligned(64)));
 static u16 sPspFramebuffers[2][SCREEN_HEIGHT][SCREEN_WIDTH] __attribute__((aligned(64)));
 u16 D_0E000000[SCREEN_HEIGHT * SCREEN_WIDTH] __attribute__((aligned(64)));
@@ -250,13 +250,6 @@ static int OotPsp_IsContainedRange(const void* ptr, size_t size, uintptr_t range
     return (start >= rangeStart) && (end <= rangeEnd);
 }
 
-int OotPsp_IsSystemHeapRange(const void* ptr, size_t size) {
-    uintptr_t heapStart = (uintptr_t)sPspSystemHeap;
-    uintptr_t heapEnd = heapStart + sizeof(sPspSystemHeap);
-
-    return OotPsp_IsContainedRange(ptr, size, heapStart, heapEnd);
-}
-
 static void OotPsp_UpdateCurrentThreadStackRange(void) {
     SceUID threadId = sceKernelGetThreadId();
     SceKernelThreadInfo threadInfo;
@@ -341,8 +334,8 @@ static uintptr_t OotPsp_StripKernelAlias(uintptr_t addr) {
 }
 
 static s32 OotPsp_IsStaticStorageRange(const void* ptr, size_t size) {
-    if (OotPsp_IsContainedRange(ptr, size, (uintptr_t)sPspSystemHeap,
-                                (uintptr_t)sPspSystemHeap + sizeof(sPspSystemHeap))) {
+    if (OotPsp_IsContainedRange(ptr, size, (uintptr_t)gOotPspSystemHeap,
+                                (uintptr_t)gOotPspSystemHeap + sizeof(gOotPspSystemHeap))) {
         return true;
     }
 
@@ -439,11 +432,6 @@ static s32 OotPsp_AddressLooksSegmented(uintptr_t addr, u32 segment) {
      * instead of passing a fake native pointer to the renderer.
      */
     return true;
-}
-
-static s32 OotPsp_IsSegmentedAddress(uintptr_t addr, u32 segment) {
-    addr = OotPsp_StripKernelAlias(addr);
-    return OotPsp_AddressLooksSegmented(addr, segment) && (gSegments[segment] != 0);
 }
 
 static void* OotPsp_TranslateSegmentedAddress(uintptr_t addr, u32 segment) {
@@ -847,8 +835,8 @@ void OotPspGame_Init(void) {
     SysCfb_Init(0);
     osViSwapBuffer(SysCfb_GetFbPtr(0));
 
-    gSystemHeapSize = sizeof(sPspSystemHeap);
-    Runtime_Init(sPspSystemHeap, gSystemHeapSize);
+    gSystemHeapSize = sizeof(gOotPspSystemHeap);
+    Runtime_Init(gOotPspSystemHeap, gSystemHeapSize);
     Regs_Init();
     Letterbox_Init();
 
