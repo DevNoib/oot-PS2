@@ -4,6 +4,7 @@
 #include "ultra64/gbi.h"
 
 #define OOT_PSP_HUD_ANCHOR_TAG 0x48554400U
+#define OOT_PSP_VISMONO_TAG 0x4D4F4E4FU
 
 typedef enum OotPspHudAnchor {
     OOT_PSP_HUD_ANCHOR_NONE,
@@ -13,5 +14,6 @@ typedef enum OotPspHudAnchor {
 } OotPspHudAnchor;
 
 #define gOotPspSetHudAnchor(pkt, anchor) gDPNoOpTag((pkt), OOT_PSP_HUD_ANCHOR_TAG | (anchor))
+#define gOotPspApplyVisMono(pkt) gDPNoOpTag((pkt), OOT_PSP_VISMONO_TAG)
 
 #endif

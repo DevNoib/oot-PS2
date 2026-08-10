@@ -102,6 +102,28 @@ static CollisionCheckInfoInit sColChkInfoInit = { 0, 12, 60, MASS_HEAVY };
 
 static f32 sSpeeds[] = { 10.0f, 9.2f };
 
+#if PLATFORM_PSP
+static void EnGoroiwa_NormalizePathPoints(Path* path) {
+    u32 points = (u32)(uintptr_t)path->points;
+    u32 swapped = ((points & 0x000000FFU) << 24) | ((points & 0x0000FF00U) << 8) |
+                  ((points & 0x00FF0000U) >> 8) | ((points & 0xFF000000U) >> 24);
+    Vec3s* pathPoints;
+    s32 i;
+
+    /* Some untyped path records and their points remain in ROM byte order in the PSP asset cache. */
+    if (((points & 0xFF000000U) != 0x02000000U) && ((swapped & 0xFF000000U) == 0x02000000U)) {
+        path->points = (Vec3s*)(uintptr_t)swapped;
+        pathPoints = SEGMENTED_TO_VIRTUAL(path->points);
+
+        for (i = 0; i < path->count; i++) {
+            pathPoints[i].x = (s16)(((u16)pathPoints[i].x << 8) | ((u16)pathPoints[i].x >> 8));
+            pathPoints[i].y = (s16)(((u16)pathPoints[i].y << 8) | ((u16)pathPoints[i].y >> 8));
+            pathPoints[i].z = (s16)(((u16)pathPoints[i].z << 8) | ((u16)pathPoints[i].z >> 8));
+        }
+    }
+}
+#endif
+
 #if DEBUG_FEATURES
 #define EN_GOROIWA_SPEED(this) (R_EN_GOROIWA_SPEED * 0.01f)
 #else
@@ -571,6 +593,9 @@ void EnGoroiwa_Init(Actor* thisx, PlayState* play) {
         Actor_Kill(&this->actor);
         return;
     }
+#if PLATFORM_PSP
+    EnGoroiwa_NormalizePathPoints(&play->pathList[pathIdx]);
+#endif
     if (play->pathList[pathIdx].count < 2) {
         PRINTF(T("Ｅｒｒｏｒ : レールデータ が不正(%s %d)\n", "Error : Rail data is invalid (%s %d)\n"), "../z_en_gr.c",
                1043);

@@ -352,6 +352,68 @@ static uint16_t gfx_scegu_make_rgb565(unsigned int r, unsigned int g, unsigned i
     return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
 }
 
+void gfx_scegu_apply_vismono(uint8_t primR, uint8_t primG, uint8_t primB, uint8_t alpha,
+                             uint8_t envR, uint8_t envG, uint8_t envB) {
+    uint16_t *pixels;
+
+    if (alpha == 0) {
+        return;
+    }
+
+    /* Complete every draw preceding the display-list marker before the CPU
+     * filters the active GU buffer. A new direct list preserves the GE state
+     * and lets later overlay commands continue in their original order. */
+    sceGuFinish();
+    sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+
+    pixels = gfx_scegu_vram_cpu_addr(sDrawBuffer);
+
+    if ((primR == 255) && (primG == 255) && (primB == 255) &&
+        (envR == 0) && (envG == 0) && (envB == 0) && (alpha == 255)) {
+        /* The Zelda flashback uses this full-strength grayscale case. Work in
+         * the framebuffer's native component widths so the hot loop needs no
+         * RGB888 conversion or alpha interpolation. */
+        for (int y = 0; y < SCR_HEIGHT; y++) {
+            uint16_t *row = pixels + (y * BUF_WIDTH);
+
+            for (int x = 0; x < SCR_WIDTH; x++) {
+                const uint16_t pixel = row[x];
+                const unsigned int r5 = (pixel >> 11) & 0x1F;
+                const unsigned int g5 = ((pixel >> 5) & 0x3F) >> 1;
+                const unsigned int b5 = pixel & 0x1F;
+                const unsigned int intensity5 = ((r5 * 2) + (g5 * 4) + b5 + 3) / 7;
+                const unsigned int intensity6 = (intensity5 << 1) | (intensity5 >> 4);
+
+                row[x] = (uint16_t)((intensity5 << 11) | (intensity6 << 5) | intensity5);
+            }
+        }
+        sceGuStart(GU_DIRECT, list);
+        return;
+    }
+
+    for (int y = 0; y < SCR_HEIGHT; y++) {
+        uint16_t *row = pixels + (y * BUF_WIDTH);
+
+        for (int x = 0; x < SCR_WIDTH; x++) {
+            const uint16_t pixel = row[x];
+            const unsigned int r = ((((pixel >> 11) & 0x1F) * 255) + 15) / 31;
+            const unsigned int g = ((((pixel >> 5) & 0x3F) * 255) + 31) / 63;
+            const unsigned int b = (((pixel & 0x1F) * 255) + 15) / 31;
+            const unsigned int intensity = ((r * 2) + (g * 4) + b + 3) / 7;
+            const unsigned int tintR = envR + (((int)primR - envR) * (int)intensity + 127) / 255;
+            const unsigned int tintG = envG + (((int)primG - envG) * (int)intensity + 127) / 255;
+            const unsigned int tintB = envB + (((int)primB - envB) * (int)intensity + 127) / 255;
+            const unsigned int outR = ((tintR * alpha) + (r * (255 - alpha)) + 127) / 255;
+            const unsigned int outG = ((tintG * alpha) + (g * (255 - alpha)) + 127) / 255;
+            const unsigned int outB = ((tintB * alpha) + (b * (255 - alpha)) + 127) / 255;
+
+            row[x] = gfx_scegu_make_rgb565(outR, outG, outB);
+        }
+    }
+
+    sceGuStart(GU_DIRECT, list);
+}
+
 static void gfx_scegu_accum_rgb565(uint16_t color, unsigned int *r, unsigned int *g, unsigned int *b) {
     *r += ((color >> 11) & 0x1F) << 3;
     *g += ((color >> 5) & 0x3F) << 2;

@@ -14,6 +14,9 @@
 #include "gfx.h"
 #include "gfxalloc.h"
 #include "vis.h"
+#if PLATFORM_PSP
+#include "oot_psp_gfx_ext.h"
+#endif
 
 // Height of the fragments the color frame buffer (CFB) is split into.
 // It is the maximum amount of lines such that all rgba16 SCREEN_WIDTH-long lines fit into
@@ -143,6 +146,27 @@ Gfx* VisMono_DesaturateDList(VisMono* this, Gfx* gfx) {
 
 void VisMono_Draw(VisMono* this, Gfx** gfxP) {
     Gfx* gfx = *gfxP;
+#if PLATFORM_PSP
+    /*
+     * The original effect reinterprets the N64 color framebuffer as 80 CI8
+     * texture strips. The PSP renderer's N64 framebuffer is only a bookkeeping
+     * buffer, not the GU draw buffer, so emulating that display list both reads
+     * black pixels and performs dozens of needless texture uploads per frame.
+     *
+     * Preserve the display-list ordering with a port command. The renderer
+     * applies the same monochrome/tint operation directly to the completed GU
+     * draw buffer when it reaches this tag.
+     */
+    gDPPipeSync(gfx++);
+    gDPSetPrimColor(gfx++, 0, 0, this->vis.primColor.r, this->vis.primColor.g, this->vis.primColor.b,
+                    this->vis.primColor.a);
+    gDPSetEnvColor(gfx++, this->vis.envColor.r, this->vis.envColor.g, this->vis.envColor.b,
+                   this->vis.envColor.a);
+    gOotPspApplyVisMono(gfx++);
+    gDPPipeSync(gfx++);
+    *gfxP = gfx;
+    return;
+#else
     u16* tlut;
     Gfx* dList;
     Gfx* dListEnd;
@@ -185,6 +209,7 @@ void VisMono_Draw(VisMono* this, Gfx** gfxP) {
     gDPPipeSync(gfx++);
 
     *gfxP = gfx;
+#endif
 }
 
 void VisMono_DrawOld(VisMono* this) {

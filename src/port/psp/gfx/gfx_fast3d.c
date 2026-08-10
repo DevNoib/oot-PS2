@@ -1845,6 +1845,8 @@ extern int texman_vram_space_available(unsigned int size);
 extern int texman_texture_slot_available(void);
 #if defined(TARGET_PSP)
 extern void gfx_scegu_sync_texture_cache(void);
+extern void gfx_scegu_apply_vismono(uint8_t primR, uint8_t primG, uint8_t primB, uint8_t alpha,
+                                    uint8_t envR, uint8_t envG, uint8_t envB);
 #endif
 
 static uint32_t gfx_texture_import_width(int tile);
@@ -5838,6 +5840,14 @@ static void gfx_dp_set_other_mode(uint32_t mode_h, uint32_t mode_l) {
 }
 
 static void gfx_dp_noop(uint32_t tag) {
+    if (tag == OOT_PSP_VISMONO_TAG) {
+        gfx_flush();
+        gfx_scegu_apply_vismono(rdp.prim_color.r, rdp.prim_color.g, rdp.prim_color.b,
+                                rdp.prim_color.a, rdp.env_color.r, rdp.env_color.g,
+                                rdp.env_color.b);
+        return;
+    }
+
     if ((tag & 0xFFFFFF00U) == OOT_PSP_HUD_ANCHOR_TAG) {
         OotPspHudAnchor anchor = tag & 0xFF;
 
