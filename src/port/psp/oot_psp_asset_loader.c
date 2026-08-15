@@ -2048,6 +2048,42 @@ s32 OotPsp_GetLoadedExternalAssetRangeFlags(const void* ptr, size_t size, u32* f
     return false;
 }
 
+s32 OotPsp_MarkLoadedExternalAssetRangeFlags(const void* ptr, size_t size, u32 flags) {
+    uintptr_t ramStart;
+    uintptr_t ramEnd;
+    size_t i;
+    s32 marked = false;
+
+    if ((flags == 0) || !OotPsp_RamRangeFromPtr(ptr, size, &ramStart, &ramEnd)) {
+        return false;
+    }
+
+    for (i = 0; i < sOotPspLoadedAssetSerialRangeCount; i++) {
+        OotPspLoadedAssetSerialRange* range = &sOotPspLoadedAssetSerialRanges[i];
+
+        if (OotPsp_RangeContains(range->ramStart, range->ramEnd, ramStart, ramEnd)) {
+            range->flags |= flags;
+            marked = true;
+            break;
+        }
+    }
+
+    for (i = 0; i < sOotPspLoadedAssetRangeHighWater; i++) {
+        OotPspLoadedAssetRange* range = &sOotPspLoadedAssetRanges[i];
+
+        if ((range->serial != 0) && OotPsp_RangeContains(range->ramStart, range->ramEnd, ramStart, ramEnd)) {
+            OotPsp_ForgetNativeTextureRangeCache(range);
+            range->flags |= flags;
+            marked = true;
+        }
+    }
+
+    if (marked) {
+        OotPsp_ClearNativeByteRangeCache();
+    }
+    return marked;
+}
+
 s32 OotPsp_IsLoadedNativeExternalAssetRange(const void* ptr, size_t size) {
     u32 flags;
 

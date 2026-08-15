@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from tools.psp_port_asset_segments import ElfObject, R_MIPS_32, SHN_UNDEF
+from tools.psp_port_asset_segments import ElfObject, R_MIPS_32, SHN_UNDEF, U64_SOURCE_DECL_RE
 from tools.psp_port_asset_snapshot import permutation, word_partitions
 from tools import version_config
 
@@ -23,6 +23,7 @@ from tools import version_config
 STT_OBJECT = 1
 STT_FILE = 4
 SHN_ABS = 0xFFF1
+RUNTIME_PATCH_TEXTURE_WORDS = 1 << 0
 TABLE_RE = re.compile(
     r'\{ (0x[0-9A-F]+), (0x[0-9A-F]+), (0x[0-9A-F]+), (0x[0-9A-F]+), '
     r'(0x[0-9A-F]+), (0x[0-9A-F]+), "([^"]+)" \}'
@@ -366,6 +367,7 @@ def resolve_manifest(elf_path: Path, manifest_path: Path, output: Path, base_elf
     permutation_data = data[cursor : cursor + permutation_count * 8]
     cursor += len(permutation_data)
     records: list[bytes] = []
+    texture_symbols_by_source: dict[str, set[str]] = {}
 
     for _ in range(count):
         source_len, symbol_len, source_vrom, size, payload_size, compressed_size, reloc_count = struct.unpack_from(
@@ -389,6 +391,13 @@ def resolve_manifest(elf_path: Path, manifest_path: Path, output: Path, base_elf
             raise ValueError(f"clean ELF is missing {source_file}:{symbol_name}")
         if symbol.size != size:
             raise ValueError(f"clean ELF size mismatch for {source_file}:{symbol_name}")
+        texture_symbols = texture_symbols_by_source.get(source_file)
+        if texture_symbols is None:
+            source_path = ROOT / source_file
+            source_text = source_path.read_text() if source_path.is_file() else ""
+            texture_symbols = {match.group("name") for match in U64_SOURCE_DECL_RE.finditer(source_text)}
+            texture_symbols_by_source[source_file] = texture_symbols
+        patch_flags = RUNTIME_PATCH_TEXTURE_WORDS if symbol_name in texture_symbols else 0
         reference_relocations = list(struct.iter_unpack("<II", relocation_data))
         relocation_offsets_list = [offset for offset, _target in reference_relocations]
         targets = relocation_targets(elf, symbol)
@@ -409,13 +418,14 @@ def resolve_manifest(elf_path: Path, manifest_path: Path, output: Path, base_elf
 
         records.append(
             struct.pack(
-                "<IIIIII",
+                "<IIIIIII",
                 destination_offset,
                 source_vrom,
                 size,
                 payload_size,
                 compressed_size,
                 reloc_count,
+                patch_flags,
             )
             + compressed
             + b"".join(
@@ -427,7 +437,7 @@ def resolve_manifest(elf_path: Path, manifest_path: Path, output: Path, base_elf
     if cursor != len(data):
         raise ValueError("trailing runtime patch manifest data")
 
-    output_data = bytearray(b"OPB1" + struct.pack("<II", count, permutation_count))
+    output_data = bytearray(b"OPB2" + struct.pack("<II", count, permutation_count))
     output_data.extend(permutation_data)
     for record in records:
         output_data.extend(record)

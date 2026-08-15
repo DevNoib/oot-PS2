@@ -61,6 +61,10 @@ void OotPsp_NormalizeRomFile(RomFile* file);
 s32 OotPsp_IsNativeExternalTextureRange(const void* ptr, size_t size);
 s32 OotPsp_IsLoadedNativeExternalAssetRange(const void* ptr, size_t size);
 s32 OotPsp_GetLoadedExternalAssetRangeFlags(const void* ptr, size_t size, u32* flags);
+/* Runtime patches first read original asset bytes, then transform selected
+ * ranges into the linked PSP representation. Record properties of that final
+ * representation so renderers do not interpret it as raw N64 data. */
+s32 OotPsp_MarkLoadedExternalAssetRangeFlags(const void* ptr, size_t size, u32 flags);
 u32 OotPsp_GetExternalAssetRangeSerial(const void* ptr, size_t size);
 s32 OotPsp_GetNativeExternalTextureMappingRange(const void* ptr, uintptr_t* ramStart, uintptr_t* ramEnd);
 s32 OotPsp_GetNativeExternalTextureRangeStart(const void* ptr, size_t size, uintptr_t* ramStart);

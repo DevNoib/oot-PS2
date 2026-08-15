@@ -9,6 +9,7 @@
 
 #define OOT_PSP_PATCH_ZERO_SELECTOR   56U
 #define OOT_PSP_PATCH_MAPPED_SELECTOR 57U
+#define OOT_PSP_PATCH_TEXTURE_WORDS   (1U << 0)
 
 extern const u8 gOotPspRuntimePatchBlob[] __attribute__((weak));
 extern const u8 gOotPspRuntimePatchBlobEnd[] __attribute__((weak));
@@ -115,8 +116,18 @@ s32 OotPspRuntimePatch_Apply(void) {
     u32 patchCount;
     u32 permutationCount;
     u32 patchIndex;
+    s32 hasPatchFlags;
 
-    if (((size_t)(end - cursor) < 12) || (memcmp(cursor, "OPB1", 4) != 0)) {
+    if ((size_t)(end - cursor) < 12) {
+        return false;
+    }
+    if (memcmp(cursor, "OPB2", 4) == 0) {
+        hasPatchFlags = true;
+    } else if (memcmp(cursor, "OPB1", 4) == 0) {
+        /* Retain compatibility with old generated blobs. They carry no range
+         * metadata and therefore cannot identify patched texture words. */
+        hasPatchFlags = false;
+    } else {
         return false;
     }
     patchCount = OotPspRuntimePatch_ReadLe32(cursor + 4);
@@ -136,12 +147,13 @@ s32 OotPspRuntimePatch_Apply(void) {
         u32 payloadSize;
         u32 compressedSize;
         u32 relocationCount;
+        u32 patchFlags;
         uLongf inflatedSize;
         u8* destination;
         u8* payload;
         u32 relocationIndex;
 
-        if ((size_t)(end - cursor) < 24) {
+        if ((size_t)(end - cursor) < (hasPatchFlags ? 28 : 24)) {
             return false;
         }
         destinationOffset = OotPspRuntimePatch_ReadLe32(cursor + 0);
@@ -150,7 +162,8 @@ s32 OotPspRuntimePatch_Apply(void) {
         payloadSize = OotPspRuntimePatch_ReadLe32(cursor + 12);
         compressedSize = OotPspRuntimePatch_ReadLe32(cursor + 16);
         relocationCount = OotPspRuntimePatch_ReadLe32(cursor + 20);
-        cursor += 24;
+        patchFlags = hasPatchFlags ? OotPspRuntimePatch_ReadLe32(cursor + 24) : 0;
+        cursor += hasPatchFlags ? 28 : 24;
         if (((size_t)(end - cursor) < compressedSize) ||
             ((size_t)(end - cursor - compressedSize) < relocationCount * 8)) {
             return false;
@@ -171,6 +184,12 @@ s32 OotPspRuntimePatch_Apply(void) {
         }
         free(payload);
         cursor += compressedSize;
+
+        if ((patchFlags & OOT_PSP_PATCH_TEXTURE_WORDS) &&
+            !OotPsp_MarkLoadedExternalAssetRangeFlags(
+                destination, size, OOT_PSP_EXTERNAL_ASSET_NATIVE | OOT_PSP_EXTERNAL_ASSET_TEXTURE_WORDS)) {
+            return false;
+        }
 
         for (relocationIndex = 0; relocationIndex < relocationCount; relocationIndex++) {
             u32 relocationOffset = OotPspRuntimePatch_ReadLe32(cursor);
