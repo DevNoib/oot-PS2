@@ -31,6 +31,7 @@ TABLE_RE = re.compile(
 ENCODED_RESOURCE_RE = re.compile(
     r"^(?P<segment>.+)_(?P<offset>[0-9A-Fa-f]{8})_(?P<kind>Tex|CITex|TLUT)$"
 )
+TEXTURE_WORD_SYMBOL_RE = re.compile(r"(?:Tex|CITex|TLUT)$")
 
 
 @dataclass
@@ -397,7 +398,13 @@ def resolve_manifest(elf_path: Path, manifest_path: Path, output: Path, base_elf
             source_text = source_path.read_text() if source_path.is_file() else ""
             texture_symbols = {match.group("name") for match in U64_SOURCE_DECL_RE.finditer(source_text)}
             texture_symbols_by_source[source_file] = texture_symbols
-        patch_flags = RUNTIME_PATCH_TEXTURE_WORDS if symbol_name in texture_symbols else 0
+        # Common/BSS symbols can be attributed to the linker-generated
+        # tls-helper.c instead of the C file that declared them. Generated
+        # asset textures consistently retain their Tex/CITex/TLUT suffix, so
+        # recognize that convention in addition to declarations found in the
+        # recorded source file.
+        is_texture_words = (symbol_name in texture_symbols) or (TEXTURE_WORD_SYMBOL_RE.search(symbol_name) is not None)
+        patch_flags = RUNTIME_PATCH_TEXTURE_WORDS if is_texture_words else 0
         reference_relocations = list(struct.iter_unpack("<II", relocation_data))
         relocation_offsets_list = [offset for offset, _target in reference_relocations]
         targets = relocation_targets(elf, symbol)
