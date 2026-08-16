@@ -14,12 +14,16 @@
 #define OOT_PSP_HOME_MENU_ITEM_RESUME_GAME 0
 #define OOT_PSP_HOME_MENU_ITEM_CONTROLLER_MAPPING 1
 #define OOT_PSP_HOME_MENU_ITEM_VIDEO_SETTINGS 2
-#define OOT_PSP_HOME_MENU_ITEM_EXIT_GAME 3
-#define OOT_PSP_HOME_MENU_ITEM_COUNT 4
+#define OOT_PSP_HOME_MENU_ITEM_ABOUT 3
+#define OOT_PSP_HOME_MENU_ITEM_EXIT_GAME 4
+#define OOT_PSP_HOME_MENU_ITEM_COUNT 5
 
 #define OOT_PSP_HOME_MENU_SCREEN_MAIN 0
 #define OOT_PSP_HOME_MENU_SCREEN_CONTROLLER_MAPPING 1
 #define OOT_PSP_HOME_MENU_SCREEN_VIDEO_SETTINGS 2
+#define OOT_PSP_HOME_MENU_SCREEN_ABOUT 3
+
+#define OOT_PSP_HOME_MENU_ABOUT_MAX_SCROLL 9
 
 #define OOT_PSP_VIDEO_MENU_ROW_OUTPUT 0
 #define OOT_PSP_VIDEO_MENU_ROW_RESOLUTION 1
@@ -44,6 +48,7 @@ static int sSelectedIndex;
 static int sScreen;
 static int sControlSelectedIndex;
 static int sVideoSelectedIndex;
+static int sAboutScrollOffset;
 static int sStatusTimer;
 static u32 sCurrentButtons;
 static u32 sLastButtons;
@@ -69,6 +74,7 @@ static void OotPspHomeMenu_Open(void) {
     sScreen = OOT_PSP_HOME_MENU_SCREEN_MAIN;
     sControlSelectedIndex = 0;
     sVideoSelectedIndex = 0;
+    sAboutScrollOffset = 0;
     sStatusTimer = 0;
     sStatusMessage[0] = '\0';
     sLastButtons = sCurrentButtons;
@@ -217,6 +223,7 @@ void OotPspHomeMenu_Init(void) {
     sScreen = OOT_PSP_HOME_MENU_SCREEN_MAIN;
     sControlSelectedIndex = 0;
     sVideoSelectedIndex = 0;
+    sAboutScrollOffset = 0;
     sStatusTimer = 0;
     sCurrentButtons = 0;
     sLastButtons = 0;
@@ -232,10 +239,20 @@ static void OotPspHomeMenu_RequestOpen(void) {
     sOpenRequested = true;
 }
 
+static void OotPspHomeMenu_MoveAboutScroll(int direction) {
+    sAboutScrollOffset += direction;
+    if (sAboutScrollOffset < 0) {
+        sAboutScrollOffset = 0;
+    } else if (sAboutScrollOffset > OOT_PSP_HOME_MENU_ABOUT_MAX_SCROLL) {
+        sAboutScrollOffset = OOT_PSP_HOME_MENU_ABOUT_MAX_SCROLL;
+    }
+}
+
 static void OotPspHomeMenu_Render(const char* statusMessage, const Color_RGB8* tunicColor) {
     u8 highlightRed = OOT_PSP_HOME_MENU_FALLBACK_HIGHLIGHT_RED;
     u8 highlightGreen = OOT_PSP_HOME_MENU_FALLBACK_HIGHLIGHT_GREEN;
     u8 highlightBlue = OOT_PSP_HOME_MENU_FALLBACK_HIGHLIGHT_BLUE;
+    int submenuSelectedIndex = sControlSelectedIndex;
 
     if (tunicColor != NULL) {
         highlightRed = tunicColor->r;
@@ -243,9 +260,13 @@ static void OotPspHomeMenu_Render(const char* statusMessage, const Color_RGB8* t
         highlightBlue = tunicColor->b;
     }
 
-    OotPspRenderer_RenderHomeMenu(sSelectedIndex, sScreen,
-                                  (sScreen == OOT_PSP_HOME_MENU_SCREEN_VIDEO_SETTINGS) ? sVideoSelectedIndex
-                                                                                       : sControlSelectedIndex,
+    if (sScreen == OOT_PSP_HOME_MENU_SCREEN_VIDEO_SETTINGS) {
+        submenuSelectedIndex = sVideoSelectedIndex;
+    } else if (sScreen == OOT_PSP_HOME_MENU_SCREEN_ABOUT) {
+        submenuSelectedIndex = sAboutScrollOffset;
+    }
+
+    OotPspRenderer_RenderHomeMenu(sSelectedIndex, sScreen, submenuSelectedIndex,
                                   statusMessage, highlightRed, highlightGreen, highlightBlue);
 }
 
@@ -333,6 +354,14 @@ OotPspHomeMenuResult OotPspHomeMenu_RunFrame(const Color_RGB8* tunicColor) {
         } else if (pressed & (PSP_CTRL_CROSS | PSP_CTRL_START)) {
             OotPspHomeMenu_ActivateVideoRow();
         }
+    } else if (sScreen == OOT_PSP_HOME_MENU_SCREEN_ABOUT) {
+        if (pressed & (PSP_CTRL_CIRCLE | PSP_CTRL_CROSS | PSP_CTRL_START)) {
+            sScreen = OOT_PSP_HOME_MENU_SCREEN_MAIN;
+        } else if (pressed & PSP_CTRL_UP) {
+            OotPspHomeMenu_MoveAboutScroll(-1);
+        } else if (pressed & PSP_CTRL_DOWN) {
+            OotPspHomeMenu_MoveAboutScroll(1);
+        }
     } else {
         if (pressed & PSP_CTRL_UP) {
             sSelectedIndex = (sSelectedIndex + OOT_PSP_HOME_MENU_ITEM_COUNT - 1) % OOT_PSP_HOME_MENU_ITEM_COUNT;
@@ -351,6 +380,9 @@ OotPspHomeMenuResult OotPspHomeMenu_RunFrame(const Color_RGB8* tunicColor) {
                 OotPspVideo_RefreshTvAvailability();
                 sScreen = OOT_PSP_HOME_MENU_SCREEN_VIDEO_SETTINGS;
                 sVideoSelectedIndex = 0;
+            } else if (sSelectedIndex == OOT_PSP_HOME_MENU_ITEM_ABOUT) {
+                sScreen = OOT_PSP_HOME_MENU_SCREEN_ABOUT;
+                sAboutScrollOffset = 0;
             } else {
                 sScreen = OOT_PSP_HOME_MENU_SCREEN_CONTROLLER_MAPPING;
             }

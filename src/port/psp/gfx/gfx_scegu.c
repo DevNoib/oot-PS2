@@ -784,15 +784,16 @@ static void gfx_scegu_render_home_menu_main(int selectedIndex, uint8_t highlight
         "Resume Game",
         "Controller Mapping",
         "Video Settings",
+        "About",
         "Exit Game",
     };
     int i;
 
     gfx_scegu_draw_rect(0, 0, HOME_MENU_WIDTH, HOME_MENU_HEIGHT, gfx_scegu_rgba(0, 0, 0, 96));
-    gfx_scegu_draw_rect(112, 48, 256, 180, gfx_scegu_rgba(0, 0, 0, 132));
+    gfx_scegu_draw_rect(112, 34, 256, 210, gfx_scegu_rgba(0, 0, 0, 132));
 
-    for (i = 0; i < 4; i++) {
-        int y = 82 + (i * 42);
+    for (i = 0; i < 5; i++) {
+        int y = 62 + (i * 38);
         unsigned int color = gfx_scegu_rgba(218, 224, 218, 255);
 
         if (selectedIndex == i) {
@@ -805,6 +806,121 @@ static void gfx_scegu_render_home_menu_main(int selectedIndex, uint8_t highlight
                                       gfx_scegu_rgba(0, 0, 0, 180),
                                       INTRAFONT_ALIGN_CENTER);
     }
+}
+
+#define HOME_MENU_ABOUT_QR_MODULE_COUNT 33
+#define HOME_MENU_ABOUT_QR_MODULE_SIZE 4
+#define HOME_MENU_ABOUT_VISIBLE_LINES 6
+
+static const char* const sHomeMenuAboutQrModules[HOME_MENU_ABOUT_QR_MODULE_COUNT] = {
+    "111111101011001101010111001111111",
+    "100000100101010100101001101000001",
+    "101110101100100110100111001011101",
+    "101110101000010001111111001011101",
+    "101110100000111100111100101011101",
+    "100000101000010011010010101000001",
+    "111111101010101010101010101111111",
+    "000000001101001111000110100000000",
+    "010101111100111010101101111101101",
+    "110000001011100111001100111100011",
+    "110111111111010100111000001110101",
+    "000110001101111110101111101011000",
+    "011100101100001010101010011101010",
+    "100001001000111001101100000110111",
+    "111101101011010000110001111110110",
+    "100001010100111010101110101101010",
+    "010111110110101011100111101010010",
+    "110010010011100000000011100101010",
+    "011101101110100011000100100000111",
+    "110100010000111100111010111100011",
+    "101011101011000101111000110000000",
+    "000010010100110000010101100000111",
+    "110100101010101010010100111111001",
+    "011001000001101101111100101100011",
+    "101011101100000000101100111111011",
+    "000000001101011111111111100011001",
+    "111111101011110110000010101011110",
+    "100000101101111100111111100010011",
+    "101110100101100101111000111111000",
+    "101110101100101110110110101011010",
+    "101110100011111011111010110011001",
+    "100000101001010000011100101000000",
+    "111111100011001001011101110011010",
+};
+
+static const char* const sHomeMenuAboutLines[] = {
+    "A PlayStation Portable port",
+    "of The Legend of Zelda:",
+    "Ocarina of Time.",
+    "",
+    "Ported by Z2442 and the PSP",
+    "Homebrew community. Thank you",
+    "everyone for all of your help",
+    "making this a reality.",
+    "I could not done this Alone.",
+    "",
+    "Scan the QR code to the right",
+    "to talk to the team on discord!",
+};
+
+static void gfx_scegu_draw_home_menu_about_qr(int x, int y) {
+    const int codeSize = HOME_MENU_ABOUT_QR_MODULE_COUNT * HOME_MENU_ABOUT_QR_MODULE_SIZE;
+    const int quietZone = HOME_MENU_ABOUT_QR_MODULE_SIZE * 2;
+    int row;
+
+    gfx_scegu_draw_rect(x - quietZone, y - quietZone, codeSize + (quietZone * 2), codeSize + (quietZone * 2),
+                        gfx_scegu_rgba(255, 255, 255, 255));
+
+    for (row = 0; row < HOME_MENU_ABOUT_QR_MODULE_COUNT; row++) {
+        int column;
+
+        for (column = 0; column < HOME_MENU_ABOUT_QR_MODULE_COUNT; column++) {
+            if (sHomeMenuAboutQrModules[row][column] == '1') {
+                gfx_scegu_draw_rect(x + (column * HOME_MENU_ABOUT_QR_MODULE_SIZE),
+                                    y + (row * HOME_MENU_ABOUT_QR_MODULE_SIZE),
+                                    HOME_MENU_ABOUT_QR_MODULE_SIZE, HOME_MENU_ABOUT_QR_MODULE_SIZE,
+                                    gfx_scegu_rgba(0, 0, 0, 255));
+            }
+        }
+    }
+}
+
+static void gfx_scegu_render_about(int scrollOffset) {
+    const unsigned int titleColor = gfx_scegu_rgba(255, 255, 245, 255);
+    const unsigned int bodyColor = gfx_scegu_rgba(218, 224, 218, 255);
+    const unsigned int hintColor = gfx_scegu_rgba(170, 190, 180, 255);
+    const unsigned int shadowColor = gfx_scegu_rgba(0, 0, 0, 180);
+    const int aboutLineCount = ARRAY_COUNT(sHomeMenuAboutLines);
+    int line;
+
+    if (scrollOffset < 0) {
+        scrollOffset = 0;
+    }
+    if (scrollOffset > (aboutLineCount - HOME_MENU_ABOUT_VISIBLE_LINES)) {
+        scrollOffset = aboutLineCount - HOME_MENU_ABOUT_VISIBLE_LINES;
+    }
+
+    gfx_scegu_draw_rect(0, 0, HOME_MENU_WIDTH, HOME_MENU_HEIGHT, gfx_scegu_rgba(0, 0, 0, 112));
+    gfx_scegu_draw_rect(20, 20, 440, 232, gfx_scegu_rgba(0, 0, 0, 154));
+    gfx_scegu_draw_home_menu_text(HOME_MENU_WIDTH / 2, 54, "About", 0.82f, titleColor, shadowColor,
+                                  INTRAFONT_ALIGN_CENTER);
+    gfx_scegu_draw_rect(282, 72, 1, 142, gfx_scegu_rgba(112, 132, 122, 180));
+
+    for (line = 0; line < HOME_MENU_ABOUT_VISIBLE_LINES; line++) {
+        gfx_scegu_draw_home_menu_text(48, 96 + (line * 20), sHomeMenuAboutLines[scrollOffset + line], 0.48f,
+                                      bodyColor, shadowColor, INTRAFONT_ALIGN_LEFT);
+    }
+
+    if (scrollOffset > 0) {
+        gfx_scegu_draw_home_menu_text(266, 90, "^", 0.48f, hintColor, shadowColor, INTRAFONT_ALIGN_CENTER);
+    }
+    if ((scrollOffset + HOME_MENU_ABOUT_VISIBLE_LINES) < aboutLineCount) {
+        gfx_scegu_draw_home_menu_text(266, 202, "v", 0.48f, hintColor, shadowColor, INTRAFONT_ALIGN_CENTER);
+    }
+
+    gfx_scegu_draw_home_menu_about_qr(306, 82);
+    gfx_scegu_draw_home_menu_text(HOME_MENU_WIDTH / 2, 232, "Up/Down scroll  Circle, Cross, or Start: Back", 0.42f,
+                                  hintColor, gfx_scegu_rgba(0, 0, 0, 160), INTRAFONT_ALIGN_CENTER);
 }
 
 void gfx_scegu_render_first_boot_progress(uint32_t progressPermille, const char* statusMessage, bool error) {
@@ -2028,6 +2144,8 @@ void gfx_scegu_render_home_menu(int selectedIndex, int screen, int submenuSelect
     } else if (screen == 2) {
         gfx_scegu_render_video_settings(submenuSelectedIndex, statusMessage, highlightRed, highlightGreen,
                                         highlightBlue);
+    } else if (screen == 3) {
+        gfx_scegu_render_about(submenuSelectedIndex);
     } else {
         gfx_scegu_render_home_menu_main(selectedIndex, highlightRed, highlightGreen, highlightBlue);
     }
