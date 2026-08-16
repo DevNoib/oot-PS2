@@ -1254,6 +1254,7 @@ PSP_PORT_RUNTIME_ASM_SOURCES := \
 	src/port/psp/gfx/gfx_transform_vfpu.s \
 	src/port/psp/oot_psp_asset_transform.s \
 	src/port/psp/oot_psp_me_kcall.s \
+	src/port/psp/oot_psp_dve_user.s \
 	src/port/psp/oot_psp_ucode_assets.s
 PSP_PORT_ROOT_ASSET_SOURCES := $(sort $(filter-out %.inc.c,$(wildcard assets/objects/*/*.c)))
 PSP_PORT_ROOT_TEXTURE_SOURCES := \
@@ -1434,6 +1435,7 @@ PSP_PORT_RUNTIME_SOURCES := \
 	src/port/psp/oot_psp_audio_backend.c \
 	src/port/psp/oot_psp_audiomgr.c \
 	src/port/psp/oot_psp_controls.c \
+	src/port/psp/oot_psp_dve.c \
 	src/port/psp/oot_psp_game.c \
 	src/port/psp/oot_psp_home_menu.c \
 	src/port/psp/oot_psp_memory.c \
@@ -1441,6 +1443,7 @@ PSP_PORT_RUNTIME_SOURCES := \
 	src/port/psp/oot_psp_performance.c \
 	src/port/psp/oot_psp_renderer.c \
 	src/port/psp/oot_psp_runtime_patch.c \
+	src/port/psp/oot_psp_video.c \
 	src/port/psp/sys_ucode_psp.c \
 	src/port/psp/libultra_psp.c \
 	src/port/psp/sched_psp.c
@@ -1491,6 +1494,14 @@ PSP_PORT_PRX_ELF := $(PSP_PORT_BUILD_DIR)/oot-psp-port.prx.elf
 PSP_PORT_STRIPPED_ELF := $(PSP_PORT_BUILD_DIR)/oot-psp-port.stripped.elf
 PSP_PORT_PRX := $(PSP_PORT_BUILD_DIR)/oot-psp-port.prx
 PSP_PORT_PBP := $(PSP_PORT_BUILD_DIR)/EBOOT.PBP
+PSP_PORT_DVEMGR_SOURCE_DIR := src/port/psp/dvemgr
+PSP_PORT_DVEMGR_BUILD_DIR := $(PSP_PORT_BUILD_DIR)/dvemgr
+PSP_PORT_DVEMGR_OBJECTS := \
+	$(PSP_PORT_DVEMGR_BUILD_DIR)/main.o \
+	$(PSP_PORT_DVEMGR_BUILD_DIR)/exports.o \
+	$(PSP_PORT_DVEMGR_BUILD_DIR)/imports.o
+PSP_PORT_DVEMGR_ELF := $(PSP_PORT_DVEMGR_BUILD_DIR)/dvemgr.elf
+PSP_PORT_DVEMGR_PRX := $(PSP_PORT_BUILD_DIR)/Plugins/dvemgr.prx
 PSP_PORT_BUILD_MODE := $(if $(filter 1,$(PSP_PORT_NO_ASSET_REGEN)),no-asset-regen,full-assets)
 PSP_PORT_BUILD_MODE_STAMP := $(PSP_PORT_BUILD_DIR)/.build-mode
 PSP_PORT_DEP_FILES := $(PSP_PORT_RUNTIME_OBJECTS:.o=.d) $(PSP_PORT_RUNTIME_ASM_OBJECTS:.o=.d) \
@@ -1499,6 +1510,7 @@ PSP_PORT_DEP_FILES := $(PSP_PORT_RUNTIME_OBJECTS:.o=.d) $(PSP_PORT_RUNTIME_ASM_O
 	$(PSP_PORT_AUDIO_TABLE_OBJECT:.o=.d) \
 	$(PSP_PORT_ASSET_SEGMENT_OBJECT:.o=.d) $(PSP_PORT_ASSET_SEGMENT_TABLE_OBJECT:.o=.d) \
 	$(PSP_PORT_PROBE_OBJECT:.o=.d)
+PSP_PORT_DEP_FILES += $(PSP_PORT_DVEMGR_OBJECTS:.o=.d)
 ifneq ($(PSP_PORT_NO_ASSET_REGEN),1)
 PSP_PORT_DEP_FILES += $(PSP_PORT_NATIVE_SEGMENT_OBJECTS:.o=.d)
 endif
@@ -1631,7 +1643,7 @@ PSP_PORT_AUDIO_CPU_CFLAGS := $(PSP_PORT_CFLAGS) $(PSP_AUDIO_CPU_OPT_CFLAGS)
 PSP_PORT_GFX_HOT_CFLAGS := $(PSP_PORT_CFLAGS) $(PSP_GFX_HOT_OPT_CFLAGS)
 
 PSP_PORT_LIBS := -L$(PSP_PORT_PSPSDK)/lib -L$(PSP_PORT_PREFIX)/lib -lme-core -lpspdmac -lpspgu -lpspgum -ljpeg -lz \
-	-lpspdisplay -lpspge -lpspfpu -lpspctrl -lpsppower -lpspaudio -lpspdebug
+	-lpspdisplay -lpspge -lpspfpu -lpspctrl -lpsppower -lpspaudio -lpspdebug -lpspkubridge
 ifneq ($(PSP_PORT_INTRAFONT_LIB),)
 PSP_PORT_LIBS += -lintrafont
 endif
@@ -1640,22 +1652,44 @@ ifneq ($(PSP_PORT_GPROF_ENABLED),)
 PSP_PORT_LINKER_DEPS := $(PSP_PORT_GPROF_LINKER_SCRIPT)
 PSP_PORT_EXTRA_LINK_OBJECTS := $(PSP_PORT_ASSET_SEGMENT_OBJECT)
 PSP_PORT_LDFLAGS := -pg -g -Wl,-T$(PSP_PORT_GPROF_LINKER_SCRIPT) -Wl,-q -Wl,-zmax-page-size=128 -Wl,--gc-sections \
-	-Wl,-u,module_info -Wl,-u,sceKernelChangeThreadPriority -Wl,-u,ootPspMeKcallImport \
+	-Wl,-u,module_info -Wl,-u,sceKernelChangeThreadPriority -Wl,-u,ootPspDveImport -Wl,-u,ootPspMeKcallImport \
 	$(PSP_PORT_LIBS)
 else
 PSP_PORT_LINKER_DEPS :=
 PSP_PORT_EXTRA_LINK_OBJECTS :=
 PSP_PORT_LDFLAGS := -specs=$(PSP_PORT_PSPSDK)/lib/prxspecs -Wl,-q,-T$(PSP_PORT_PSPSDK)/lib/linkfile.prx \
 	-Wl,-zmax-page-size=128 -Wl,--gc-sections -Wl,-u,module_info -Wl,-u,sceKernelChangeThreadPriority \
-	-Wl,-u,ootPspMeKcallImport \
+	-Wl,-u,ootPspDveImport -Wl,-u,ootPspMeKcallImport \
 	$(PSP_PORT_PSPSDK)/lib/prxexports.o $(PSP_PORT_LIBS)
 endif
 
-psp-port: $(PSP_PORT_PBP)
-	@echo "PSP port is up to date: $(PSP_PORT_PBP)"
+psp-port: $(PSP_PORT_PBP) $(PSP_PORT_DVEMGR_PRX)
+	@echo "PSP port is up to date: $(PSP_PORT_PBP) and $(PSP_PORT_DVEMGR_PRX)"
 
 psp-port-eboot:
-	$(MAKE) PSP_PORT_NO_ASSET_REGEN=1 $(PSP_PORT_PBP)
+	$(MAKE) PSP_PORT_NO_ASSET_REGEN=1 $(PSP_PORT_PBP) $(PSP_PORT_DVEMGR_PRX)
+
+$(PSP_PORT_DVEMGR_BUILD_DIR)/%.o: $(PSP_PORT_DVEMGR_SOURCE_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(PSP_PORT_CC) -MMD -MP -MF $(@:.o=.d) -MT $@ -c -Os -G0 -Wall -fshort-wchar -fno-pic \
+		-mno-check-zero-division -D_PSP_FW_VERSION=500 -I$(PSP_PORT_PSPSDK)/include -I$(PSP_PORT_PREFIX)/include \
+		-o $@ $<
+
+$(PSP_PORT_DVEMGR_BUILD_DIR)/%.o: $(PSP_PORT_DVEMGR_SOURCE_DIR)/%.s
+	@mkdir -p $(dir $@)
+	$(PSP_PORT_CC) -MMD -MP -MF $(@:.o=.d) -MT $@ -c -x assembler-with-cpp -D_PSP_FW_VERSION=500 \
+		-I$(PSP_PORT_PSPSDK)/include -I$(PSP_PORT_PREFIX)/include -o $@ $<
+
+$(PSP_PORT_DVEMGR_ELF): $(PSP_PORT_DVEMGR_OBJECTS)
+	$(PSP_PORT_CC) -L$(PSP_PORT_PREFIX)/lib -L$(PSP_PORT_PSPSDK)/lib \
+		-specs=$(PSP_PORT_PSPSDK)/lib/prxspecs -Wl,-q,-T$(PSP_PORT_PSPSDK)/lib/linkfile.prx \
+		-nostartfiles -Wl,-zmax-page-size=128 $^ -nostdlib -lpspdebug -lpspdisplay_driver -lpspctrl_driver \
+		-lpspmodinfo -lpspsdk -lpspkernel -o $@
+	psp-fixup-imports $@
+
+$(PSP_PORT_DVEMGR_PRX): $(PSP_PORT_DVEMGR_ELF)
+	@mkdir -p $(dir $@)
+	psp-prxgen $< $@
 
 $(PSP_PORT_BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)

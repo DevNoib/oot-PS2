@@ -1,3 +1,5 @@
+#include <pspctrl.h>
+#include <pspdebug.h>
 #include <pspfpu.h>
 #include <pspkernel.h>
 #include <psppower.h>
@@ -14,10 +16,12 @@
 #include "oot_psp_asset_loader.h"
 #include "oot_psp_audio_backend.h"
 #include "oot_psp_controls.h"
+#include "oot_psp_dve.h"
 #include "oot_psp_home_menu.h"
 #include "oot_psp_performance.h"
 #include "oot_psp_renderer.h"
 #include "oot_psp_runtime_patch.h"
+#include "oot_psp_video.h"
 #include "play_state.h"
 #include "player.h"
 #include "setup_state.h"
@@ -135,9 +139,17 @@ static void OotPspSetupCallbacks(void) {
 }
 
 int main(int argc, char** argv) {
+    const char* executablePath = ((argc > 0) && (argv != NULL)) ? argv[0] : NULL;
 
+    /* Keep Daedalus's startup order through DVE detection. */
+    scePowerSetClockFrequency(333, 333, 166);
     pspFpuSetEnable(0);
     (void)OotPspAudioBackend_BootMe();
+    pspDebugScreenInit();
+    sceCtrlSetSamplingCycle(0);
+    sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
+    (void)OotPspDve_Init(executablePath);
+    OotPspVideo_Init(executablePath);
     OotPspHomeMenu_Init();
     OotPspSetupCallbacks();
 
@@ -152,13 +164,15 @@ int main(int argc, char** argv) {
     OotPspRenderer_Init();
     osSyncPrintf("oot-psp probe rom md5=%s size=%u header=%02X%02X%02X%02X\n", gOotPspRomMd5, gOotPspRomSize,
                  gOotPspRomHeader[0], gOotPspRomHeader[1], gOotPspRomHeader[2], gOotPspRomHeader[3]);
-    if (!OotPsp_AssetInit(((argc > 0) && (argv != NULL)) ? argv[0] : NULL)) {
+    if (!OotPsp_AssetInit(executablePath)) {
         osSyncPrintf("oot-psp asset initialization failed\n");
+        OotPspDve_Shutdown();
         sceKernelExitGame();
         return 1;
     }
     if (!OotPspRuntimePatch_Apply()) {
         osSyncPrintf("oot-psp runtime asset patching failed\n");
+        OotPspDve_Shutdown();
         sceKernelExitGame();
         return 1;
     }
@@ -225,6 +239,7 @@ int main(int argc, char** argv) {
     OotPspPerformance_Flush();
 #endif
     Graph_Destroy(&gfxCtx);
+    OotPspDve_Shutdown();
     sceKernelExitGame();
     return 0;
 }

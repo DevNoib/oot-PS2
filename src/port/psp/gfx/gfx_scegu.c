@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdbool.h>
 
@@ -35,18 +36,42 @@
 #include "psp_texture_manager.h"
 #include "gfx_fast3d.h"
 #include "oot_psp_controls.h"
+#include "oot_psp_dve.h"
 #include "oot_psp_memory.h"
+#include "oot_psp_video.h"
 
 #ifndef OOT_PSP_WAIT_VBLANK
 #define OOT_PSP_WAIT_VBLANK 1
 #endif
 #include "oot_port_macros.h"
 
-#define BUF_WIDTH (512)
-#define SCR_WIDTH (480)
-#define SCR_HEIGHT (272)
-#define FRAMEBUFFER_SIZE (BUF_WIDTH * SCR_HEIGHT * sizeof(uint16_t))
-#define VRAM_SIZE (2 * 1024 * 1024)
+#define LCD_BUFFER_WIDTH 512
+#define LCD_SCREEN_WIDTH 480
+#define LCD_SCREEN_HEIGHT 272
+#define TV_BUFFER_WIDTH 768
+#define TV_SCREEN_WIDTH 720
+#define TV_SCREEN_HEIGHT 480
+#define TV_INTERLACED_BUFFER_HEIGHT 503
+#define TV_INTERLACED_FIELD_OFFSET 262
+#define HOME_MENU_WIDTH 480
+#define HOME_MENU_HEIGHT 272
+#define PSP_PHAT_VRAM_SIZE (2 * 1024 * 1024)
+
+static int sBufferWidth = LCD_BUFFER_WIDTH;
+static int sScreenWidth = LCD_SCREEN_WIDTH;
+static int sScreenHeight = LCD_SCREEN_HEIGHT;
+static int sMaxBufferWidth = LCD_BUFFER_WIDTH;
+static int sMaxScreenHeight = LCD_SCREEN_HEIGHT;
+static int sColorPixelFormat = GU_PSM_5650;
+static int sColorPixelSize = sizeof(uint16_t);
+static size_t sFramebufferCapacity;
+static size_t sVramSize = PSP_PHAT_VRAM_SIZE;
+
+#define BUF_WIDTH (sBufferWidth)
+#define SCR_WIDTH (sScreenWidth)
+#define SCR_HEIGHT (sScreenHeight)
+#define FRAMEBUFFER_SIZE ((size_t)BUF_WIDTH * (size_t)SCR_HEIGHT * (size_t)sColorPixelSize)
+#define VRAM_SIZE (sVramSize)
 
 float identity_matrix[4][4] __attribute__((aligned(16))) = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 }, { 0, 0, 0, 1 } };
 
@@ -268,15 +293,19 @@ static unsigned int sTextureEnvColor = 0xffffffff;
 static void *sDrawBuffer;
 static void *sDisplayBuffer;
 static void *sDepthBuffer;
+static void *sPrimaryBuffer;
+static void *sSecondaryBuffer;
+static bool sInterlacedOutput;
+static bool sCrt240pOutput;
 static bool sPauseBgActive;
 static bool sPauseBgCaptureRequested;
 static bool sPauseBgCaptured;
-static uint16_t sPauseBgBuffer[BUF_WIDTH * SCR_HEIGHT] __attribute__((aligned(64)));
+static void *sPauseBgBuffer;
 static bool sHomeMenuBgActive;
 static bool sHomeMenuBgCaptureRequested;
 static bool sHomeMenuBgCaptured;
-static uint16_t sHomeMenuBgBuffer[BUF_WIDTH * SCR_HEIGHT] __attribute__((aligned(64)));
-static uint16_t sHomeMenuBgBlurScratch[BUF_WIDTH * SCR_HEIGHT] __attribute__((aligned(64)));
+static void *sHomeMenuBgBuffer;
+static void *sHomeMenuBgBlurScratch;
 #if OOT_PSP_USE_INTRAFONT
 static intraFont *sHomeMenuFont;
 static bool sHomeMenuFontInitTried;
@@ -288,8 +317,9 @@ static void *gfx_scegu_vram_cpu_addr(const void *vramBuffer) {
 
 static bool gfx_scegu_read_depth(int32_t x, int32_t y, uint16_t *depth) {
     const float scale = (float)gfx_current_dimensions.height / 240.0f;
-    const int32_t screenX = (int32_t)(240.0f + ((x - 160) * scale));
-    const int32_t screenY = (int32_t)(((272.0f - gfx_current_dimensions.height) * 0.5f) + (y * scale));
+    const int32_t screenX = (int32_t)(((float)SCR_WIDTH * 0.5f) + ((x - 160) * scale));
+    const int32_t screenY =
+        (int32_t)((((float)SCR_HEIGHT - gfx_current_dimensions.height) * 0.5f) + (y * scale));
     const volatile uint16_t *depthBuffer;
 
     if (sDepthBuffer == NULL || screenX < 0 || screenX >= SCR_WIDTH || screenY < 0 || screenY >= SCR_HEIGHT) {
@@ -326,13 +356,13 @@ bool gfx_scegu_depth_test(int32_t x, int32_t y, float projectedZ) {
     return projectedDepth >= depth;
 }
 
-static void gfx_scegu_copy_framebuffer_from_vram(uint16_t *dst, const void *src) {
+static void gfx_scegu_copy_framebuffer_from_vram(void *dst, const void *src) {
     const void *srcAddr = gfx_scegu_vram_cpu_addr(src);
 
     OotPsp_MemcpyVfpu(dst, srcAddr, FRAMEBUFFER_SIZE);
 }
 
-static void gfx_scegu_copy_framebuffer_to_vram(void *dst, const uint16_t *src) {
+static void gfx_scegu_copy_framebuffer_to_vram(void *dst, const void *src) {
     void *dstAddr = gfx_scegu_vram_cpu_addr(dst);
 
     OotPsp_MemcpyVfpu(dstAddr, src, FRAMEBUFFER_SIZE);
@@ -341,7 +371,7 @@ static void gfx_scegu_copy_framebuffer_to_vram(void *dst, const uint16_t *src) {
 
 static void gfx_scegu_apply_home_menu_2d_view(void) {
     sceGuOffset(2048 - (SCR_WIDTH / 2), 2048 - (SCR_HEIGHT / 2));
-    sceGuViewport(2048 - (SCR_WIDTH / 2), 2048 - (SCR_HEIGHT / 2), SCR_WIDTH, SCR_HEIGHT);
+    sceGuViewport(2048, 2048, SCR_WIDTH, SCR_HEIGHT);
     sceGuScissor(0, 0, SCR_WIDTH, SCR_HEIGHT);
     sceGuEnable(GU_SCISSOR_TEST);
     sceGuSetMatrix(GU_VIEW, (const ScePspFMatrix4 *)identity_matrix);
@@ -354,7 +384,7 @@ static uint16_t gfx_scegu_make_rgb565(unsigned int r, unsigned int g, unsigned i
 
 void gfx_scegu_apply_vismono(uint8_t primR, uint8_t primG, uint8_t primB, uint8_t alpha,
                              uint8_t envR, uint8_t envG, uint8_t envB) {
-    uint16_t *pixels;
+    void *framebuffer;
 
     if (alpha == 0) {
         return;
@@ -366,7 +396,36 @@ void gfx_scegu_apply_vismono(uint8_t primR, uint8_t primG, uint8_t primB, uint8_
     sceGuFinish();
     sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
 
-    pixels = gfx_scegu_vram_cpu_addr(sDrawBuffer);
+    framebuffer = gfx_scegu_vram_cpu_addr(sDrawBuffer);
+
+    if (sColorPixelFormat == GU_PSM_8888) {
+        uint32_t *pixels = (uint32_t *)framebuffer;
+
+        for (int y = 0; y < SCR_HEIGHT; y++) {
+            uint32_t *row = pixels + (y * BUF_WIDTH);
+
+            for (int x = 0; x < SCR_WIDTH; x++) {
+                const uint32_t pixel = row[x];
+                const unsigned int r = pixel & 0xFF;
+                const unsigned int g = (pixel >> 8) & 0xFF;
+                const unsigned int b = (pixel >> 16) & 0xFF;
+                const unsigned int intensity = ((r * 2) + (g * 4) + b + 3) / 7;
+                const unsigned int tintR = envR + (((int)primR - envR) * (int)intensity + 127) / 255;
+                const unsigned int tintG = envG + (((int)primG - envG) * (int)intensity + 127) / 255;
+                const unsigned int tintB = envB + (((int)primB - envB) * (int)intensity + 127) / 255;
+                const unsigned int outR = ((tintR * alpha) + (r * (255 - alpha)) + 127) / 255;
+                const unsigned int outG = ((tintG * alpha) + (g * (255 - alpha)) + 127) / 255;
+                const unsigned int outB = ((tintB * alpha) + (b * (255 - alpha)) + 127) / 255;
+
+                row[x] = (pixel & 0xFF000000U) | (outB << 16) | (outG << 8) | outR;
+            }
+        }
+
+        sceGuStart(GU_DIRECT, list);
+        return;
+    }
+
+    uint16_t *pixels = (uint16_t *)framebuffer;
 
     if ((primR == 255) && (primG == 255) && (primB == 255) &&
         (envR == 0) && (envG == 0) && (envB == 0) && (alpha == 255)) {
@@ -430,14 +489,51 @@ static int gfx_scegu_clamp_int(int value, int min, int max) {
     return value;
 }
 
-static void gfx_scegu_blur_framebuffer_565(uint16_t *pixels) {
+static void gfx_scegu_blur_framebuffer(void *framebuffer) {
     static const int offsets[3] = { -3, 0, 3 };
     int x;
     int y;
     int ox;
     int oy;
 
-    OotPsp_MemcpyVfpu(sHomeMenuBgBlurScratch, pixels, FRAMEBUFFER_SIZE);
+    OotPsp_MemcpyVfpu(sHomeMenuBgBlurScratch, framebuffer, FRAMEBUFFER_SIZE);
+
+    if (sColorPixelFormat == GU_PSM_8888) {
+        uint32_t *pixels = (uint32_t *)framebuffer;
+        uint32_t *scratch = (uint32_t *)sHomeMenuBgBlurScratch;
+
+        for (y = 0; y < SCR_HEIGHT; y++) {
+            for (x = 0; x < SCR_WIDTH; x++) {
+                unsigned int r = 0;
+                unsigned int g = 0;
+                unsigned int b = 0;
+                unsigned int a = 0;
+
+                for (oy = 0; oy < 3; oy++) {
+                    int sampleY = gfx_scegu_clamp_int(y + offsets[oy], 0, SCR_HEIGHT - 1);
+
+                    for (ox = 0; ox < 3; ox++) {
+                        int sampleX = gfx_scegu_clamp_int(x + offsets[ox], 0, SCR_WIDTH - 1);
+                        uint32_t color = pixels[(sampleY * BUF_WIDTH) + sampleX];
+
+                        r += color & 0xFF;
+                        g += (color >> 8) & 0xFF;
+                        b += (color >> 16) & 0xFF;
+                        a += color >> 24;
+                    }
+                }
+
+                scratch[(y * BUF_WIDTH) + x] = ((a / 9) << 24) | ((b / 9) << 16) | ((g / 9) << 8) | (r / 9);
+            }
+        }
+
+        OotPsp_MemcpyVfpu(framebuffer, scratch, FRAMEBUFFER_SIZE);
+        sceKernelDcacheWritebackRange(framebuffer, FRAMEBUFFER_SIZE);
+        return;
+    }
+
+    uint16_t *pixels = (uint16_t *)framebuffer;
+    uint16_t *scratch = (uint16_t *)sHomeMenuBgBlurScratch;
 
     for (y = 0; y < SCR_HEIGHT; y++) {
         for (x = 0; x < SCR_WIDTH; x++) {
@@ -455,20 +551,45 @@ static void gfx_scegu_blur_framebuffer_565(uint16_t *pixels) {
                 }
             }
 
-            sHomeMenuBgBlurScratch[(y * BUF_WIDTH) + x] = gfx_scegu_make_rgb565(r / 9, g / 9, b / 9);
+            scratch[(y * BUF_WIDTH) + x] = gfx_scegu_make_rgb565(r / 9, g / 9, b / 9);
         }
     }
 
-    OotPsp_MemcpyVfpu(pixels, sHomeMenuBgBlurScratch, FRAMEBUFFER_SIZE);
-    sceKernelDcacheWritebackRange(pixels, FRAMEBUFFER_SIZE);
+    OotPsp_MemcpyVfpu(framebuffer, scratch, FRAMEBUFFER_SIZE);
+    sceKernelDcacheWritebackRange(framebuffer, FRAMEBUFFER_SIZE);
 }
 
 static unsigned int gfx_scegu_rgba(unsigned int r, unsigned int g, unsigned int b, unsigned int a) {
     return (a << 24) | (b << 16) | (g << 8) | r;
 }
 
+static float gfx_scegu_home_menu_scale(void) {
+    float scaleX = (float)SCR_WIDTH / HOME_MENU_WIDTH;
+    float scaleY = (float)SCR_HEIGHT / HOME_MENU_HEIGHT;
+
+    return (scaleX < scaleY) ? scaleX : scaleY;
+}
+
+static int gfx_scegu_home_menu_x(float x) {
+    float scale = gfx_scegu_home_menu_scale();
+    float offset = ((float)SCR_WIDTH - (HOME_MENU_WIDTH * scale)) * 0.5f;
+
+    return (int)(offset + (x * scale) + 0.5f);
+}
+
+static int gfx_scegu_home_menu_y(float y) {
+    float scale = gfx_scegu_home_menu_scale();
+    float offset = ((float)SCR_HEIGHT - (HOME_MENU_HEIGHT * scale)) * 0.5f;
+
+    return (int)(offset + (y * scale) + 0.5f);
+}
+
 static void gfx_scegu_draw_rect(int x, int y, int width, int height, unsigned int color) {
     VertexColor *verts;
+    int left;
+    int top;
+    int right;
+    int bottom;
 
     if ((width <= 0) || (height <= 0)) {
         return;
@@ -480,17 +601,22 @@ static void gfx_scegu_draw_rect(int x, int y, int width, int height, unsigned in
         return;
     }
 
+    left = gfx_scegu_home_menu_x((float)x);
+    top = gfx_scegu_home_menu_y((float)y);
+    right = gfx_scegu_home_menu_x((float)(x + width));
+    bottom = gfx_scegu_home_menu_y((float)(y + height));
+
     verts[0].a = 0;
     verts[0].b = 0;
     verts[0].color = color;
-    verts[0].x = (unsigned short)x;
-    verts[0].y = (unsigned short)y;
+    verts[0].x = (unsigned short)left;
+    verts[0].y = (unsigned short)top;
     verts[0].z = 0;
     verts[1].a = 0;
     verts[1].b = 0;
     verts[1].color = color;
-    verts[1].x = (unsigned short)(x + width);
-    verts[1].y = (unsigned short)(y + height);
+    verts[1].x = (unsigned short)right;
+    verts[1].y = (unsigned short)bottom;
     verts[1].z = 0;
 
     gfx_scegu_apply_home_menu_2d_view();
@@ -618,10 +744,14 @@ static void gfx_scegu_draw_home_menu_text(int x, int y, const char *text, float 
                                           unsigned int shadowColor, unsigned int options) {
 #if OOT_PSP_USE_INTRAFONT
     if (gfx_scegu_ensure_home_menu_font()) {
+        float scale = gfx_scegu_home_menu_scale();
+
         gfx_scegu_apply_home_menu_2d_view();
         intraFontActivate(sHomeMenuFont);
-        intraFontSetStyle(sHomeMenuFont, size, color, shadowColor, 0.0f, options | INTRAFONT_STRING_ASCII);
-        intraFontPrint(sHomeMenuFont, (float)x, (float)y, text);
+        intraFontSetStyle(sHomeMenuFont, size * scale, color, shadowColor, 0.0f,
+                          options | INTRAFONT_STRING_ASCII);
+        intraFontPrint(sHomeMenuFont, (float)gfx_scegu_home_menu_x((float)x),
+                       (float)gfx_scegu_home_menu_y((float)y), text);
         return;
     }
 #endif
@@ -653,15 +783,16 @@ static void gfx_scegu_render_home_menu_main(int selectedIndex, uint8_t highlight
     static const char *items[] = {
         "Resume Game",
         "Controller Mapping",
+        "Video Settings",
         "Exit Game",
     };
     int i;
 
-    gfx_scegu_draw_rect(0, 0, SCR_WIDTH, SCR_HEIGHT, gfx_scegu_rgba(0, 0, 0, 96));
-    gfx_scegu_draw_rect(112, 70, 256, 142, gfx_scegu_rgba(0, 0, 0, 132));
+    gfx_scegu_draw_rect(0, 0, HOME_MENU_WIDTH, HOME_MENU_HEIGHT, gfx_scegu_rgba(0, 0, 0, 96));
+    gfx_scegu_draw_rect(112, 48, 256, 180, gfx_scegu_rgba(0, 0, 0, 132));
 
-    for (i = 0; i < 3; i++) {
-        int y = 106 + (i * 38);
+    for (i = 0; i < 4; i++) {
+        int y = 82 + (i * 42);
         unsigned int color = gfx_scegu_rgba(218, 224, 218, 255);
 
         if (selectedIndex == i) {
@@ -670,7 +801,8 @@ static void gfx_scegu_render_home_menu_main(int selectedIndex, uint8_t highlight
             color = gfx_scegu_rgba(255, 255, 245, 255);
         }
 
-        gfx_scegu_draw_home_menu_text(SCR_WIDTH / 2, y, items[i], 0.72f, color, gfx_scegu_rgba(0, 0, 0, 180),
+        gfx_scegu_draw_home_menu_text(HOME_MENU_WIDTH / 2, y, items[i], 0.72f, color,
+                                      gfx_scegu_rgba(0, 0, 0, 180),
                                       INTRAFONT_ALIGN_CENTER);
     }
 }
@@ -695,13 +827,14 @@ void gfx_scegu_render_first_boot_progress(uint32_t progressPermille, const char*
     statusColor = error ? gfx_scegu_rgba(255, 210, 196, 255) : gfx_scegu_rgba(218, 224, 218, 255);
 
     gfx_scegu_prepare_home_menu_draw();
-    gfx_scegu_draw_rect(0, 0, SCR_WIDTH, SCR_HEIGHT, gfx_scegu_rgba(7, 15, 13, 255));
+    gfx_scegu_draw_rect(0, 0, HOME_MENU_WIDTH, HOME_MENU_HEIGHT, gfx_scegu_rgba(7, 15, 13, 255));
     gfx_scegu_draw_rect(34, 36, 412, 200, gfx_scegu_rgba(0, 0, 0, 154));
 
-    gfx_scegu_draw_home_menu_text(SCR_WIDTH / 2, 78, error ? "Asset Setup Failed" : "Preparing Game Data",
+    gfx_scegu_draw_home_menu_text(HOME_MENU_WIDTH / 2, 78,
+                                  error ? "Asset Setup Failed" : "Preparing Game Data",
                                   0.84f, gfx_scegu_rgba(255, 255, 245, 255),
                                   gfx_scegu_rgba(0, 0, 0, 180), INTRAFONT_ALIGN_CENTER);
-    gfx_scegu_draw_home_menu_text(SCR_WIDTH / 2, 118,
+    gfx_scegu_draw_home_menu_text(HOME_MENU_WIDTH / 2, 118,
                                   (statusMessage != NULL) ? statusMessage : "Starting asset setup", 0.60f,
                                   statusColor, gfx_scegu_rgba(0, 0, 0, 180), INTRAFONT_ALIGN_CENTER);
 
@@ -713,10 +846,10 @@ void gfx_scegu_render_first_boot_progress(uint32_t progressPermille, const char*
     }
 
     snprintf(percentText, sizeof(percentText), "%lu%%", (unsigned long)(progressPermille / 10));
-    gfx_scegu_draw_home_menu_text(SCR_WIDTH / 2, 194, percentText, 0.58f,
+    gfx_scegu_draw_home_menu_text(HOME_MENU_WIDTH / 2, 194, percentText, 0.58f,
                                   gfx_scegu_rgba(255, 255, 245, 255), gfx_scegu_rgba(0, 0, 0, 180),
                                   INTRAFONT_ALIGN_CENTER);
-    gfx_scegu_draw_home_menu_text(SCR_WIDTH / 2, 222,
+    gfx_scegu_draw_home_menu_text(HOME_MENU_WIDTH / 2, 222,
                                   error ? "Check the ROM and restart" : "First launch only - do not power off",
                                   0.48f, gfx_scegu_rgba(170, 190, 180, 255), gfx_scegu_rgba(0, 0, 0, 160),
                                   INTRAFONT_ALIGN_CENTER);
@@ -746,9 +879,9 @@ static void gfx_scegu_render_controller_mapping(int selectedIndex, const char* s
         firstRow = totalRows - visibleRows;
     }
 
-    gfx_scegu_draw_rect(0, 0, SCR_WIDTH, SCR_HEIGHT, gfx_scegu_rgba(0, 0, 0, 112));
+    gfx_scegu_draw_rect(0, 0, HOME_MENU_WIDTH, HOME_MENU_HEIGHT, gfx_scegu_rgba(0, 0, 0, 112));
     gfx_scegu_draw_rect(34, 20, 412, 232, gfx_scegu_rgba(0, 0, 0, 154));
-    gfx_scegu_draw_home_menu_text(SCR_WIDTH / 2, 50, "Controller Mapping", 0.82f,
+    gfx_scegu_draw_home_menu_text(HOME_MENU_WIDTH / 2, 50, "Controller Mapping", 0.82f,
                                   gfx_scegu_rgba(255, 255, 245, 255), gfx_scegu_rgba(0, 0, 0, 180),
                                   INTRAFONT_ALIGN_CENTER);
 
@@ -779,33 +912,112 @@ static void gfx_scegu_render_controller_mapping(int selectedIndex, const char* s
                 snprintf(line, sizeof(line), "Back");
             }
 
-            intraFontSetStyle(sHomeMenuFont, 0.68f, color, gfx_scegu_rgba(0, 0, 0, 180), 0.0f,
-                              INTRAFONT_ALIGN_LEFT | INTRAFONT_STRING_ASCII);
-            intraFontPrint(sHomeMenuFont, 70.0f, (float)y, line);
+            gfx_scegu_draw_home_menu_text(70, y, line, 0.68f, color, gfx_scegu_rgba(0, 0, 0, 180),
+                                          INTRAFONT_ALIGN_LEFT);
         }
-
-        intraFontSetStyle(sHomeMenuFont, 0.48f, gfx_scegu_rgba(170, 190, 180, 255),
-                          gfx_scegu_rgba(0, 0, 0, 160), 0.0f, INTRAFONT_ALIGN_CENTER | INTRAFONT_STRING_ASCII);
 
         if (firstRow > 0) {
-            intraFontPrint(sHomeMenuFont, 422.0f, 82.0f, "^");
+            gfx_scegu_draw_home_menu_text(422, 82, "^", 0.48f, gfx_scegu_rgba(170, 190, 180, 255),
+                                          gfx_scegu_rgba(0, 0, 0, 160), INTRAFONT_ALIGN_CENTER);
         }
         if ((firstRow + visibleRows) < totalRows) {
-            intraFontPrint(sHomeMenuFont, 422.0f, 214.0f, "v");
+            gfx_scegu_draw_home_menu_text(422, 214, "v", 0.48f, gfx_scegu_rgba(170, 190, 180, 255),
+                                          gfx_scegu_rgba(0, 0, 0, 160), INTRAFONT_ALIGN_CENTER);
         }
 
         if ((statusMessage != NULL) && (statusMessage[0] != '\0')) {
-            intraFontPrint(sHomeMenuFont, SCR_WIDTH / 2, 242.0f, statusMessage);
+            gfx_scegu_draw_home_menu_text(HOME_MENU_WIDTH / 2, 242, statusMessage, 0.48f,
+                                          gfx_scegu_rgba(170, 190, 180, 255), gfx_scegu_rgba(0, 0, 0, 160),
+                                          INTRAFONT_ALIGN_CENTER);
         } else {
-            intraFontPrint(sHomeMenuFont, SCR_WIDTH / 2, 242.0f, "Left/Right change  Cross select  Circle back");
+            gfx_scegu_draw_home_menu_text(HOME_MENU_WIDTH / 2, 242,
+                                          "Left/Right change  Cross select  Circle back", 0.48f,
+                                          gfx_scegu_rgba(170, 190, 180, 255), gfx_scegu_rgba(0, 0, 0, 160),
+                                          INTRAFONT_ALIGN_CENTER);
         }
         return;
     }
 #endif
 
-    gfx_scegu_draw_fallback_text_centered(SCR_WIDTH / 2, 116, "Controller Mapping", 4,
+    gfx_scegu_draw_fallback_text_centered(HOME_MENU_WIDTH / 2, 116, "Controller Mapping", 4,
                                           gfx_scegu_rgba(255, 255, 245, 255));
-    gfx_scegu_draw_fallback_text_centered(SCR_WIDTH / 2, 158, "Back", 4, gfx_scegu_rgba(218, 224, 218, 255));
+    gfx_scegu_draw_fallback_text_centered(HOME_MENU_WIDTH / 2, 158, "Back", 4,
+                                          gfx_scegu_rgba(218, 224, 218, 255));
+}
+
+static void gfx_scegu_render_video_settings(int selectedIndex, const char* statusMessage, uint8_t highlightRed,
+                                             uint8_t highlightGreen, uint8_t highlightBlue) {
+    char line[80];
+    int row;
+
+    gfx_scegu_draw_rect(0, 0, HOME_MENU_WIDTH, HOME_MENU_HEIGHT, gfx_scegu_rgba(0, 0, 0, 112));
+    gfx_scegu_draw_rect(34, 20, 412, 232, gfx_scegu_rgba(0, 0, 0, 154));
+    gfx_scegu_draw_home_menu_text(HOME_MENU_WIDTH / 2, 48, "Video Settings", 0.82f,
+                                  gfx_scegu_rgba(255, 255, 245, 255), gfx_scegu_rgba(0, 0, 0, 180),
+                                  INTRAFONT_ALIGN_CENTER);
+
+#if OOT_PSP_USE_INTRAFONT
+    if (gfx_scegu_ensure_home_menu_font()) {
+        for (row = 0; row < 7; row++) {
+            int y = 76 + (row * 22);
+            unsigned int color = gfx_scegu_rgba(218, 224, 218, 255);
+
+            if (selectedIndex == row) {
+                gfx_scegu_draw_rect(54, y - 17, 372, 22,
+                                    gfx_scegu_rgba(highlightRed, highlightGreen, highlightBlue, 205));
+                color = gfx_scegu_rgba(255, 255, 245, 255);
+            }
+
+            switch (row) {
+                case 0:
+                    snprintf(line, sizeof(line), "Output: %s", OotPspVideo_GetOutputName());
+                    break;
+                case 1:
+                    snprintf(line, sizeof(line), "Resolution: %s", OotPspVideo_GetResolutionName());
+                    break;
+                case 2:
+                    snprintf(line, sizeof(line), "Aspect Ratio: %s", OotPspVideo_GetAspectName());
+                    break;
+                case 3:
+                    snprintf(line, sizeof(line), "Apply video mode");
+                    break;
+                case 4:
+                    snprintf(line, sizeof(line), "Save video.ini");
+                    break;
+                case 5:
+                    snprintf(line, sizeof(line), "Reset defaults");
+                    break;
+                default:
+                    snprintf(line, sizeof(line), "Back");
+                    break;
+            }
+
+            gfx_scegu_draw_home_menu_text(70, y, line, 0.68f, color, gfx_scegu_rgba(0, 0, 0, 180),
+                                          INTRAFONT_ALIGN_LEFT);
+        }
+
+        if ((statusMessage != NULL) && (statusMessage[0] != '\0')) {
+            gfx_scegu_draw_home_menu_text(HOME_MENU_WIDTH / 2, 242, statusMessage, 0.48f,
+                                          gfx_scegu_rgba(170, 190, 180, 255), gfx_scegu_rgba(0, 0, 0, 160),
+                                          INTRAFONT_ALIGN_CENTER);
+        } else if (!OotPspVideo_IsTvAvailable()) {
+            gfx_scegu_draw_home_menu_text(HOME_MENU_WIDTH / 2, 242, "TV output requires a Slim and video cable",
+                                          0.48f, gfx_scegu_rgba(170, 190, 180, 255),
+                                          gfx_scegu_rgba(0, 0, 0, 160), INTRAFONT_ALIGN_CENTER);
+        } else {
+            gfx_scegu_draw_home_menu_text(HOME_MENU_WIDTH / 2, 242,
+                                          "Left/Right change  Cross select  Circle back", 0.48f,
+                                          gfx_scegu_rgba(170, 190, 180, 255), gfx_scegu_rgba(0, 0, 0, 160),
+                                          INTRAFONT_ALIGN_CENTER);
+        }
+        return;
+    }
+#endif
+
+    gfx_scegu_draw_fallback_text_centered(HOME_MENU_WIDTH / 2, 116, "Video Settings", 4,
+                                          gfx_scegu_rgba(255, 255, 245, 255));
+    gfx_scegu_draw_fallback_text_centered(HOME_MENU_WIDTH / 2, 158, "Back", 4,
+                                          gfx_scegu_rgba(218, 224, 218, 255));
 }
 
 static inline uint32_t get_shader_remap(uint32_t id) {
@@ -1351,31 +1563,54 @@ void gfx_scegu_draw_triangles_2d(float buf_vbo[], UNUSED size_t buf_vbo_len, UNU
     sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, quad);
 }
 
-static void gfx_scegu_init(void) {
-    sceGuInit();
-    sDepthTestEnabled = true;
-    sDepthWriteEnabled = true;
-    sTextureEnvColor = 0xffffffff;
-    active_texture_tile = -1;
-    sAppliedShader = NULL;
-    sAppliedSamplerStateValid = false;
-    memset(tmu_state, 0, sizeof(tmu_state));
+static void gfx_scegu_set_mode_geometry(const OotPspVideoMode *mode) {
+    sBufferWidth = mode->bufferWidth;
+    sScreenWidth = mode->displayWidth;
+    sScreenHeight = mode->displayHeight;
+}
 
-    void *fbp0 = getStaticVramBuffer(BUF_WIDTH, SCR_HEIGHT, GU_PSM_5650);
-    void *fbp1 = getStaticVramBuffer(BUF_WIDTH, SCR_HEIGHT, GU_PSM_5650);
-    void *zbp = getStaticVramBuffer(BUF_WIDTH, SCR_HEIGHT, GU_PSM_4444);
-    size_t texmanSize;
+static bool gfx_scegu_mode_is_interlaced(const OotPspVideoMode *mode) {
+    /* Native 320x240 asks the DVE to present that framebuffer directly.  It
+     * uses the interlaced TV route, but does not need the 720x503 field-layout
+     * conversion used by a full 480i framebuffer. */
+    return mode->tvOutput && !mode->crt240p && (mode->dveMode == 0x1D1);
+}
 
-    sDrawBuffer = fbp0;
-    sDisplayBuffer = fbp1;
-    sDepthBuffer = zbp;
+static void gfx_scegu_reset_framebuffers(void) {
+    sDrawBuffer = sPrimaryBuffer;
+    sDisplayBuffer = sSecondaryBuffer;
+}
 
+static void gfx_scegu_log_display_mode(const OotPspVideoMode *requestedMode, int result) {
+    int activeMode = -1;
+    int activeWidth = -1;
+    int activeHeight = -1;
+    int getModeResult = sceDisplayGetMode(&activeMode, &activeWidth, &activeHeight);
+
+    printf("oot-psp video set result=%d requested=%X/%dx%d active_result=%d active=%X/%dx%d "
+           "buffer=%dx%d interlaced=%d crt240p=%d\n",
+           result, requestedMode->dveMode, requestedMode->dveWidth, requestedMode->dveHeight, getModeResult,
+           activeMode, activeWidth, activeHeight, BUF_WIDTH, SCR_HEIGHT, sInterlacedOutput ? 1 : 0,
+           sCrt240pOutput ? 1 : 0);
+}
+
+static int gfx_scegu_set_hardware_video_mode(const OotPspVideoMode *mode) {
+    if (OotPspDve_IsAvailable()) {
+        return OotPspDve_SetVideoOut(mode->dveOutput, mode->dveMode, mode->dveWidth, mode->dveHeight, 1, 15, 0);
+    }
+    if (mode->tvOutput) {
+        return -1;
+    }
+    return sceDisplaySetMode(0, LCD_SCREEN_WIDTH, LCD_SCREEN_HEIGHT);
+}
+
+static void gfx_scegu_configure_gu_buffers(void) {
     sceGuStart(GU_DIRECT, list);
-    sceGuDrawBuffer(GU_PSM_5650, fbp0, BUF_WIDTH);
-    sceGuDispBuffer(SCR_WIDTH, SCR_HEIGHT, fbp1, BUF_WIDTH);
-    sceGuDepthBuffer(zbp, BUF_WIDTH);
+    sceGuDrawBuffer(sColorPixelFormat, sDrawBuffer, BUF_WIDTH);
+    sceGuDispBuffer(SCR_WIDTH, SCR_HEIGHT, sDisplayBuffer, BUF_WIDTH);
+    sceGuDepthBuffer(sDepthBuffer, BUF_WIDTH);
     sceGuOffset(2048 - (SCR_WIDTH / 2), 2048 - (SCR_HEIGHT / 2));
-    sceGuViewport(2048 - (SCR_WIDTH / 2), 2048 - (SCR_HEIGHT / 2), SCR_WIDTH, SCR_HEIGHT);
+    sceGuViewport(2048, 2048, SCR_WIDTH, SCR_HEIGHT);
     sceGuDepthRange(0xffff, 0);
     sceGuScissor(0, 0, SCR_WIDTH, SCR_HEIGHT);
     sceGuEnable(GU_SCISSOR_TEST);
@@ -1384,7 +1619,7 @@ static void gfx_scegu_init(void) {
     sceGuShadeModel(GU_SMOOTH);
     sceGuEnable(GU_CLIP_PLANES);
     sceGuEnable(GU_ALPHA_TEST);
-    sceGuAlphaFunc(GU_GREATER, 0x55, 0xff); /* 0.3f  */
+    sceGuAlphaFunc(GU_GREATER, 0x55, 0xff);
     sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
     sceGuDisable(GU_LIGHTING);
     sceGuDisable(GU_BLEND);
@@ -1394,26 +1629,205 @@ static void gfx_scegu_init(void) {
     sceGuTexEnvColor(0xffffffff);
     sceGuTexOffset(0.0f, 0.0f);
     sceGuTexWrap(GU_REPEAT, GU_REPEAT);
-
     sceGuFinish();
-    sceGuSync(0, 0);
+    sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
     sceDisplayWaitVblankStart();
     sceGuDisplay(GU_TRUE);
+}
 
-    texmanSize = getStaticVramBytesRemaining();
-    if (texmanSize > TEXMAN_BUFFER_SIZE) {
-        texmanSize = TEXMAN_BUFFER_SIZE;
+static void gfx_scegu_invalidate_mode_state(void) {
+    sPauseBgCaptureRequested = false;
+    sPauseBgCaptured = false;
+    sHomeMenuBgCaptureRequested = false;
+    sHomeMenuBgCaptured = false;
+    texman_invalidate_binding();
+    active_texture_tile = -1;
+    sAppliedShader = NULL;
+    sAppliedSamplerStateValid = false;
+}
+
+int gfx_scegu_apply_video_mode(void) {
+    OotPspVideoMode mode;
+    int result;
+
+    OotPspVideo_GetMode(&mode);
+    if ((mode.bufferWidth > sMaxBufferWidth) || (mode.displayHeight > sMaxScreenHeight)) {
+        printf("oot-psp TV buffers unavailable requested=%dx%d max=%dx%d edram=%lu\n", mode.bufferWidth,
+               mode.displayHeight, sMaxBufferWidth, sMaxScreenHeight, (unsigned long)sVramSize);
+        return -1000;
     }
 
-    void *texman_buffer = getStaticVramBufferBytes(texmanSize);
-    void *texman_aligned = (void *) ((((unsigned int) texman_buffer + TEX_ALIGNMENT - 1) / TEX_ALIGNMENT) * TEX_ALIGNMENT);
-    texman_reset(texman_aligned, texmanSize);
+    /* Daedalus enters the replacement route with GU output still enabled.
+     * Disabling it here leaves some Slim firmwares in LCD scanout mode; using
+     * the Display button then only mirrors the old 480x272 surface. */
+    sceGuInit();
+
+    /* Match Daedalus's working transition order exactly: select the DVE route
+     * first, then rebuild the GU/display buffers for that route.  Calling the
+     * DVE sequence after sceGuDispBuffer leaves some hardware with the TV
+     * encoder active but the scanout still using the old LCD buffer layout. */
+    gfx_scegu_set_mode_geometry(&mode);
+    sInterlacedOutput = gfx_scegu_mode_is_interlaced(&mode);
+    sCrt240pOutput = mode.crt240p != 0;
+    gfx_scegu_reset_framebuffers();
+    gfx_scegu_invalidate_mode_state();
+    result = gfx_scegu_set_hardware_video_mode(&mode);
+    if (result < 0) {
+        int failedResult = result;
+
+        OotPspVideo_ForceLcd();
+        OotPspVideo_GetMode(&mode);
+        gfx_scegu_set_mode_geometry(&mode);
+        sInterlacedOutput = false;
+        sCrt240pOutput = false;
+        gfx_scegu_reset_framebuffers();
+        gfx_scegu_invalidate_mode_state();
+        if (gfx_scegu_set_hardware_video_mode(&mode) < 0) {
+            (void)sceDisplaySetMode(0, LCD_SCREEN_WIDTH, LCD_SCREEN_HEIGHT);
+        }
+        gfx_scegu_configure_gu_buffers();
+        OotPspVideo_CommitMode();
+        sceDisplaySetFrameBuf(gfx_scegu_vram_cpu_addr(sDisplayBuffer), BUF_WIDTH, sColorPixelFormat,
+                              PSP_DISPLAY_SETBUF_NEXTFRAME);
+        gfx_set_dimensions((uint32_t)mode.viewportWidth, (uint32_t)mode.viewportHeight);
+        gfx_scegu_log_display_mode(&mode, failedResult);
+        return failedResult;
+    }
+
+    gfx_scegu_configure_gu_buffers();
+    OotPspVideo_CommitMode();
+    sceDisplaySetFrameBuf(gfx_scegu_vram_cpu_addr(sDisplayBuffer), BUF_WIDTH, sColorPixelFormat,
+                          PSP_DISPLAY_SETBUF_NEXTFRAME);
+    gfx_set_dimensions((uint32_t)mode.viewportWidth, (uint32_t)mode.viewportHeight);
+    gfx_scegu_log_display_mode(&mode, result);
+    return 0;
+}
+
+static void gfx_scegu_init(void) {
+    OotPspVideoMode mode;
+    OotPspVideoMode initialMode;
+    void *backgroundStorage;
+    void *fbp0;
+    void *fbp1;
+    void *zbp;
+    size_t texmanSize;
+
+    sVramSize = OotPspDve_GetEdramSize();
+    if (sVramSize < sceGeEdramGetSize()) {
+        sVramSize = sceGeEdramGetSize();
+    }
+    if (sVramSize < PSP_PHAT_VRAM_SIZE) {
+        sVramSize = PSP_PHAT_VRAM_SIZE;
+    }
+    if (OotPspDve_IsAvailable() && (sVramSize >= (4 * 1024 * 1024))) {
+        sMaxBufferWidth = TV_BUFFER_WIDTH;
+        sMaxScreenHeight = TV_SCREEN_HEIGHT;
+        /* The original Daedalus DVE path requires a 32-bit display buffer on
+         * Slim hardware. Keep LCD and TV in the same format so switching modes
+         * cannot reinterpret an in-flight framebuffer. */
+        sColorPixelFormat = GU_PSM_8888;
+        sColorPixelSize = sizeof(uint32_t);
+    } else {
+        sMaxBufferWidth = LCD_BUFFER_WIDTH;
+        sMaxScreenHeight = LCD_SCREEN_HEIGHT;
+        sColorPixelFormat = GU_PSM_5650;
+        sColorPixelSize = sizeof(uint16_t);
+        OotPspVideo_ForceLcd();
+    }
+
+    OotPspVideo_GetMode(&mode);
+    initialMode = mode;
+    initialMode.tvOutput = false;
+    initialMode.bufferWidth = LCD_BUFFER_WIDTH;
+    initialMode.displayWidth = LCD_SCREEN_WIDTH;
+    initialMode.displayHeight = LCD_SCREEN_HEIGHT;
+    initialMode.crt240p = 0;
+    initialMode.viewportWidth = (mode.viewportWidth == 720) ? 480 : 362;
+    initialMode.viewportHeight = LCD_SCREEN_HEIGHT;
+    initialMode.dveOutput = 0;
+    initialMode.dveMode = 0;
+    initialMode.dveWidth = LCD_SCREEN_WIDTH;
+    initialMode.dveHeight = LCD_SCREEN_HEIGHT;
+    gfx_scegu_set_mode_geometry(&initialMode);
+    sFramebufferCapacity =
+        (size_t)sMaxBufferWidth * (size_t)sMaxScreenHeight * (size_t)sColorPixelSize;
+    backgroundStorage = memalign(64, sFramebufferCapacity * 3);
+    if (backgroundStorage == NULL) {
+        sceIoWrite(1, "OUT OF FRAMEBUFFER MEMORY!\n", 27);
+        sceKernelExitGame();
+    }
+    sPauseBgBuffer = backgroundStorage;
+    sHomeMenuBgBuffer = (uint8_t *)backgroundStorage + sFramebufferCapacity;
+    sHomeMenuBgBlurScratch = (uint8_t *)backgroundStorage + (sFramebufferCapacity * 2);
+
+    sceGuInit();
+    (void)sceDisplaySetMode(0, LCD_SCREEN_WIDTH, LCD_SCREEN_HEIGHT);
+    sDepthTestEnabled = true;
+    sDepthWriteEnabled = true;
+    sTextureEnvColor = 0xffffffff;
+    active_texture_tile = -1;
+    sAppliedShader = NULL;
+    sAppliedSamplerStateValid = false;
+    memset(tmu_state, 0, sizeof(tmu_state));
+
+    fbp0 = getStaticVramBuffer((unsigned int)sMaxBufferWidth, (unsigned int)sMaxScreenHeight, sColorPixelFormat);
+    fbp1 = getStaticVramBuffer((unsigned int)sMaxBufferWidth,
+                               (unsigned int)((sMaxBufferWidth == TV_BUFFER_WIDTH)
+                                                  ? TV_INTERLACED_BUFFER_HEIGHT
+                                                  : sMaxScreenHeight),
+                               sColorPixelFormat);
+    zbp = getStaticVramBuffer((unsigned int)sMaxBufferWidth, (unsigned int)sMaxScreenHeight, GU_PSM_4444);
+
+    sPrimaryBuffer = fbp0;
+    sSecondaryBuffer = fbp1;
+    sInterlacedOutput = false;
+    sCrt240pOutput = false;
+    gfx_scegu_reset_framebuffers();
+    sDepthBuffer = zbp;
+
+    gfx_scegu_configure_gu_buffers();
+    sceDisplaySetFrameBuf(gfx_scegu_vram_cpu_addr(sDisplayBuffer), BUF_WIDTH, sColorPixelFormat,
+                          PSP_DISPLAY_SETBUF_NEXTFRAME);
+
+    void *texman_buffer;
+
+    if (sMaxBufferWidth == TV_BUFFER_WIDTH) {
+        /* Daedalus fills almost all 4 MiB of EDRAM with its 32-bit TV frame
+         * and depth buffers. Its texture allocation therefore falls through
+         * to RAM. Keep OOT textures out of the small upper-EDRAM tail too:
+         * some Slim firmwares corrupt texture fetches from that region while
+         * the DVE is scanning a 720-wide framebuffer. */
+        texmanSize = TEXMAN_BUFFER_SIZE;
+        texman_buffer = memalign(64, texmanSize);
+    } else {
+        texmanSize = getStaticVramBytesRemaining();
+        if (texmanSize > TEXMAN_BUFFER_SIZE) {
+            texmanSize = TEXMAN_BUFFER_SIZE;
+        }
+        texman_buffer = getStaticVramBufferBytes(texmanSize);
+    }
     if (!texman_buffer) {
         char msg[32];
         sprintf(msg, "OUT OF MEMORY!\n");
         sceIoWrite(1, msg, strlen(msg));
 
         sceKernelExitGame();
+    }
+    void *texman_aligned = (void *) ((((unsigned int) texman_buffer + TEX_ALIGNMENT - 1) / TEX_ALIGNMENT) * TEX_ALIGNMENT);
+    texman_reset(texman_aligned, texmanSize);
+    printf("oot-psp texture cache storage=%s addr=%p size=%lu\n",
+           (sMaxBufferWidth == TV_BUFFER_WIDTH) ? "ram" : "edram", texman_aligned,
+           (unsigned long)texmanSize);
+
+    if (mode.tvOutput) {
+        int result = gfx_scegu_apply_video_mode();
+
+        if (result < 0) {
+            printf("oot-psp startup TV mode failed result=%d edram=%lu\n", result, (unsigned long)sVramSize);
+        }
+    } else {
+        gfx_scegu_set_mode_geometry(&mode);
+        OotPspVideo_CommitMode();
     }
 
 #if OOT_PSP_USE_INTRAFONT
@@ -1438,14 +1852,16 @@ static void gfx_scegu_start_frame(void) {
     sAppliedSamplerStateValid = false;
 
     if (sHomeMenuBgCaptureRequested) {
-        gfx_scegu_copy_framebuffer_from_vram(sHomeMenuBgBuffer, sDisplayBuffer);
-        gfx_scegu_blur_framebuffer_565(sHomeMenuBgBuffer);
+        gfx_scegu_copy_framebuffer_from_vram(sHomeMenuBgBuffer,
+                                             sInterlacedOutput ? sPrimaryBuffer : sDisplayBuffer);
+        gfx_scegu_blur_framebuffer(sHomeMenuBgBuffer);
         sHomeMenuBgCaptureRequested = false;
         sHomeMenuBgCaptured = true;
     }
 
     if (sPauseBgCaptureRequested) {
-        gfx_scegu_copy_framebuffer_from_vram(sPauseBgBuffer, sDisplayBuffer);
+        gfx_scegu_copy_framebuffer_from_vram(sPauseBgBuffer,
+                                             sInterlacedOutput ? sPrimaryBuffer : sDisplayBuffer);
         sPauseBgCaptureRequested = false;
         sPauseBgCaptured = true;
     }
@@ -1505,6 +1921,29 @@ static void gfx_scegu_start_frame(void) {
 void gfx_scegu_on_resize(void) {
 }
 
+static void gfx_scegu_present_interlaced(void) {
+    const uintptr_t src = (uintptr_t)gfx_scegu_vram_cpu_addr(sPrimaryBuffer);
+    const uintptr_t dst = (uintptr_t)gfx_scegu_vram_cpu_addr(sSecondaryBuffer);
+    const int rowBytes = BUF_WIDTH * sColorPixelSize;
+
+    /* The DVE's 480i modes expose two 240-line fields in one 503-line
+     * framebuffer. Odd source lines occupy rows 0..239; even lines start at
+     * row 262. Native 320x240 bypasses this conversion entirely. */
+    sceGuStart(GU_DIRECT, list);
+    sceGuCopyImage(sColorPixelFormat, 0, 0, TV_SCREEN_WIDTH, TV_SCREEN_HEIGHT / 2, BUF_WIDTH * 2,
+                   (void *)(src + (uintptr_t)rowBytes), 0, 0, BUF_WIDTH, (void *)dst);
+    sceGuTexSync();
+    sceGuCopyImage(sColorPixelFormat, 0, 0, TV_SCREEN_WIDTH, TV_SCREEN_HEIGHT / 2, BUF_WIDTH * 2,
+                   (void *)src, 0, 0, BUF_WIDTH,
+                   (void *)(dst + ((uintptr_t)BUF_WIDTH * TV_INTERLACED_FIELD_OFFSET * sColorPixelSize)));
+    sceGuTexSync();
+    sceGuFinish();
+    sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+
+    sDrawBuffer = sPrimaryBuffer;
+    sDisplayBuffer = sSecondaryBuffer;
+}
+
 static void gfx_scegu_end_frame(void) {
     void *previousDrawBuffer = sDrawBuffer;
 
@@ -1513,8 +1952,12 @@ static void gfx_scegu_end_frame(void) {
 #if OOT_PSP_WAIT_VBLANK
     sceDisplayWaitVblankStart();
 #endif
-    sDrawBuffer = sceGuSwapBuffers();
-    sDisplayBuffer = previousDrawBuffer;
+    if (sInterlacedOutput) {
+        gfx_scegu_present_interlaced();
+    } else {
+        sDrawBuffer = sceGuSwapBuffers();
+        sDisplayBuffer = previousDrawBuffer;
+    }
 }
 
 static void gfx_scegu_finish_render(void) {
@@ -1575,13 +2018,16 @@ void gfx_scegu_set_home_menu_background_active(bool active) {
     }
 }
 
-void gfx_scegu_render_home_menu(int selectedIndex, int screen, int controlSelectedIndex, const char* statusMessage,
+void gfx_scegu_render_home_menu(int selectedIndex, int screen, int submenuSelectedIndex, const char* statusMessage,
                                 uint8_t highlightRed, uint8_t highlightGreen, uint8_t highlightBlue) {
     gfx_scegu_prepare_home_menu_draw();
 
     if (screen == 1) {
-        gfx_scegu_render_controller_mapping(controlSelectedIndex, statusMessage, highlightRed, highlightGreen,
+        gfx_scegu_render_controller_mapping(submenuSelectedIndex, statusMessage, highlightRed, highlightGreen,
                                              highlightBlue);
+    } else if (screen == 2) {
+        gfx_scegu_render_video_settings(submenuSelectedIndex, statusMessage, highlightRed, highlightGreen,
+                                        highlightBlue);
     } else {
         gfx_scegu_render_home_menu_main(selectedIndex, highlightRed, highlightGreen, highlightBlue);
     }

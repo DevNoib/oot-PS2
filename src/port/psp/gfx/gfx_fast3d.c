@@ -1898,13 +1898,7 @@ static unsigned int gfx_texture_cache_upload_size(uint16_t width, uint16_t heigh
 }
 #endif
 
-static void gfx_texture_cache_clear(void) {
-    gfx_flush();
-#if defined(TARGET_PSP)
-    /* gfx_flush only emits the pending draw. The GU may still be sampling the
-     * old texture allocations, so wait before texman_clear recycles their VRAM. */
-    gfx_scegu_sync_texture_cache();
-#endif
+static void gfx_texture_cache_reset(void) {
     texman_clear();
 #if defined(TARGET_PSP)
     for (uint32_t i = 0; i < ARRAY_COUNTU(sFlameAtlasCache); i++) {
@@ -1923,6 +1917,25 @@ static void gfx_texture_cache_clear(void) {
     memset(rendering_state.textures, 0, sizeof(rendering_state.textures));
     rendering_state.tri_pipeline_dirty = true;
     rendering_state.backend_state_dirty = true;
+}
+
+static void gfx_texture_cache_clear(void) {
+    gfx_flush();
+#if defined(TARGET_PSP)
+    /* gfx_flush only emits the pending draw. The GU may still be sampling the
+     * old texture allocations, so wait before texman_clear recycles their VRAM. */
+    gfx_scegu_sync_texture_cache();
+#endif
+    gfx_texture_cache_reset();
+}
+
+void gfx_invalidate_texture_cache(void) {
+    /* A PSP display-route change reinitializes the GU and may disturb texture
+     * data in the upper EDRAM aperture. This entry point is called between
+     * frames, after the old GU list has completed, so only discard the CPU and
+     * VRAM allocation metadata here. The next frame will upload every texture
+     * again without trying to finish a display list that is no longer open. */
+    gfx_texture_cache_reset();
 }
 
 static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, const uint8_t *orig_addr,

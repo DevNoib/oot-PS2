@@ -6,9 +6,7 @@
 #include <psprtc.h>
 
 #include "oot_port_macros.h"
-
-#define OOT_PSP_SCREEN_WIDTH  480
-#define OOT_PSP_SCREEN_HEIGHT 272
+#include "oot_psp_video.h"
 
 static bool sQuitRequested;
 static unsigned int sLastSwapBeginUsec;
@@ -40,8 +38,11 @@ static void gfx_window_psp_main_loop(void (*run_one_game_iter)(void)) {
 }
 
 static void gfx_window_psp_get_dimensions(uint32_t* width, uint32_t* height) {
-    *width = OOT_PSP_SCREEN_WIDTH;
-    *height = OOT_PSP_SCREEN_HEIGHT;
+    OotPspVideoMode mode;
+
+    OotPspVideo_GetActiveMode(&mode);
+    *width = (uint32_t)mode.viewportWidth;
+    *height = (uint32_t)mode.viewportHeight;
 }
 
 static void gfx_window_psp_handle_events(void) {

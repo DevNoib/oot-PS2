@@ -6,16 +6,15 @@
 #include "gfx/gfx_rendering_api.h"
 #include "gfx/gfx_window_psp.h"
 #include "oot_psp_performance.h"
-
-#define OOT_PSP_DISPLAY_WIDTH  480
-#define OOT_PSP_DISPLAY_HEIGHT 272
+#include "oot_psp_video.h"
 
 extern struct GfxRenderingAPI gfx_scegu_api;
 extern void gfx_scegu_request_pause_background(void);
 extern void gfx_scegu_set_pause_background_active(bool active);
 extern void gfx_scegu_request_home_menu_background(void);
 extern void gfx_scegu_set_home_menu_background_active(bool active);
-extern void gfx_scegu_render_home_menu(int selectedIndex, int screen, int controlSelectedIndex,
+extern int gfx_scegu_apply_video_mode(void);
+extern void gfx_scegu_render_home_menu(int selectedIndex, int screen, int submenuSelectedIndex,
                                        const char* statusMessage, uint8_t highlightRed, uint8_t highlightGreen,
                                        uint8_t highlightBlue);
 extern void gfx_scegu_render_first_boot_progress(uint32_t progressPermille, const char* statusMessage, bool error);
@@ -27,7 +26,7 @@ static bool sInitialized;
 typedef struct OotPspHomeMenuRenderArgs {
     int selectedIndex;
     int screen;
-    int controlSelectedIndex;
+    int submenuSelectedIndex;
     const char* statusMessage;
     uint8_t highlightRed;
     uint8_t highlightGreen;
@@ -43,7 +42,7 @@ typedef struct OotPspFirstBootProgressRenderArgs {
 static void OotPspRenderer_DrawHomeMenu(void* arg) {
     const OotPspHomeMenuRenderArgs* menu = (const OotPspHomeMenuRenderArgs*)arg;
 
-    gfx_scegu_render_home_menu(menu->selectedIndex, menu->screen, menu->controlSelectedIndex, menu->statusMessage,
+    gfx_scegu_render_home_menu(menu->selectedIndex, menu->screen, menu->submenuSelectedIndex, menu->statusMessage,
                                menu->highlightRed, menu->highlightGreen, menu->highlightBlue);
 }
 
@@ -101,12 +100,15 @@ bool OotPspRenderer_DepthTest(int32_t x, int32_t y, float projectedZ) {
 }
 
 void OotPspRenderer_SetJpegBackgroundResolution(bool active, uint32_t width, uint32_t height) {
-    OotPspRenderer_Init();
+    OotPspVideoMode mode;
 
-    if (!active || (width == 0) || (height == 0) || (width > OOT_PSP_DISPLAY_WIDTH) ||
-        (height > OOT_PSP_DISPLAY_HEIGHT)) {
-        width = OOT_PSP_DISPLAY_WIDTH;
-        height = OOT_PSP_DISPLAY_HEIGHT;
+    OotPspRenderer_Init();
+    OotPspVideo_GetActiveMode(&mode);
+
+    if (!active || (width == 0) || (height == 0) || (width > (uint32_t)mode.viewportWidth) ||
+        (height > (uint32_t)mode.viewportHeight)) {
+        width = (uint32_t)mode.viewportWidth;
+        height = (uint32_t)mode.viewportHeight;
     }
 
     gfx_set_dimensions(width, height);
@@ -128,7 +130,20 @@ void OotPspRenderer_SetHomeMenuBackgroundActive(bool active) {
     gfx_scegu_set_home_menu_background_active(active);
 }
 
-void OotPspRenderer_RenderHomeMenu(int selectedIndex, int screen, int controlSelectedIndex,
+int OotPspRenderer_ApplyVideoSettings(void) {
+    int result;
+
+    OotPspRenderer_Init();
+    result = gfx_scegu_apply_video_mode();
+    /* The DVE transition reinitializes the GU and can invalidate texture data
+     * already resident in the upper half of Slim EDRAM. Rebuild the cache on
+     * the next clean frame for both the selected route and the LCD fallback. */
+    gfx_invalidate_texture_cache();
+    gfx_invalidate_render_state();
+    return result;
+}
+
+void OotPspRenderer_RenderHomeMenu(int selectedIndex, int screen, int submenuSelectedIndex,
                                    const char* statusMessage, uint8_t highlightRed, uint8_t highlightGreen,
                                    uint8_t highlightBlue) {
     OotPspHomeMenuRenderArgs args;
@@ -136,7 +151,7 @@ void OotPspRenderer_RenderHomeMenu(int selectedIndex, int screen, int controlSel
     OotPspRenderer_Init();
     args.selectedIndex = selectedIndex;
     args.screen = screen;
-    args.controlSelectedIndex = controlSelectedIndex;
+    args.submenuSelectedIndex = submenuSelectedIndex;
     args.statusMessage = statusMessage;
     args.highlightRed = highlightRed;
     args.highlightGreen = highlightGreen;

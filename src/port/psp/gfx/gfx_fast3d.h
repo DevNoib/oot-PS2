@@ -29,6 +29,7 @@ void gfx_end_frame(void);
 void gfx_set_dimensions(uint32_t width, uint32_t height);
 void gfx_render_callback_frame(void (*draw_callback)(void *arg), void *arg);
 void gfx_invalidate_render_state(void);
+void gfx_invalidate_texture_cache(void);
 
 #ifdef __cplusplus
 }

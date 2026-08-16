@@ -9,12 +9,27 @@ Install the files on the memory stick with this layout:
 ```text
 OOT_PSP/
 ├── EBOOT.PBP
+├── Plugins/
+│   └── dvemgr.prx
 └── data/
     └── basrom.z64
 ```
 
 `data/baserom.z64` is also accepted as a compatibility spelling. The ROM must
 be the big-endian, compressed NTSC 1.0 ROM (32 MiB, CRC32 `CD16C529`).
+
+`dvemgr.prx` enables the system's DVE video-output controls on PSP Slim and
+later models. The port checks the hardware model through kuBridge before it
+loads the module, so a PSP-1000 does not load or call the DVE bridge. On a Slim
+or later system the module stays loaded for the session, even when no cable was
+present during startup.
+
+Press HOME and open **Video Settings** to choose LCD or TV output, 480i or
+480p, and a 4:3 or 16:9 viewport. Composite cables are limited to 480i;
+component cables can use either TV resolution. **Apply video mode** changes the
+current session, while **Save video.ini** writes the selection beside
+`EBOOT.PBP` for later launches. TV output remains unavailable on a PSP-1000, if
+no cable is detected, or if `Plugins/dvemgr.prx` is missing.
 
 On the first launch, the port validates the ROM and atomically creates
 `data/segments/oot_psp_assets.bin`. It also fills the executable's zero
