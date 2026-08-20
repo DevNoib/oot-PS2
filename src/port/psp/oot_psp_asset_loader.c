@@ -20,12 +20,9 @@
 #define OOT_PSP_LOADED_ASSET_RANGE_COUNT    4096
 #define OOT_PSP_ASSET_READ_CHUNK_SIZE       0x4000
 #define OOT_PSP_ASSET_CACHE_SIZE            (2 * 1024 * 1024)
-#define OOT_PSP_HOT_ASSET_CACHE_COUNT       4
-#define OOT_PSP_HOT_READ_TRACKER_COUNT      16
-#define OOT_PSP_HOT_READ_PROMOTE_COUNT      4
-#define OOT_PSP_HOT_READ_MAX_SIZE           OOT_PSP_ASSET_CACHE_SIZE
 #define OOT_PSP_PACKED_CACHE_BLOCK_SIZE     0x10000
-#define OOT_PSP_PACKED_DIRECT_READ_MIN_SIZE (4 * OOT_PSP_PACKED_CACHE_BLOCK_SIZE)
+#define OOT_PSP_PACKED_DIRECT_READ_MIN_SIZE OOT_PSP_PACKED_CACHE_BLOCK_SIZE
+#define OOT_PSP_PACKED_DIRECT_READ_CHUNK_SIZE 0x20000
 #define OOT_PSP_PACKED_CACHE_TARGET_SIZE    (4 * 1024 * 1024)
 #define OOT_PSP_PACKED_CACHE_MIN_SIZE       (1 * 1024 * 1024)
 #define OOT_PSP_PACKED_CACHE_ALLOC_STEP     (1024 * 1024)
@@ -93,12 +90,6 @@ typedef struct OotPspAssetWindowCache {
     s32 loading;
 } OotPspAssetWindowCache;
 
-typedef struct OotPspHotReadTracker {
-    const OotPspExternalAsset* asset;
-    u32 lastUsed;
-    u8 hits;
-} OotPspHotReadTracker;
-
 /* Packed file cache: raw 64 KiB blocks from data/segments/oot_psp_assets.bin. */
 typedef struct OotPspPackedAssetCacheBlock {
     size_t blockIndex;
@@ -152,6 +143,8 @@ static size_t sOotPspNativeTextureRangeCacheNext;
 static size_t sOotPspNativeAssetRangeCacheNext;
 static size_t sOotPspLoadedAssetRangeNext;
 static size_t sOotPspLoadedAssetRangeHighWater;
+static u16 sOotPspLoadedAssetRangeFreeSlots[OOT_PSP_LOADED_ASSET_RANGE_COUNT];
+static size_t sOotPspLoadedAssetRangeFreeSlotCount;
 static u32 sOotPspLoadedAssetSerial = 1;
 static u32 sOotPspAssetCacheClock;
 static volatile s32 sOotPspForegroundAssetReadWaiters;
@@ -169,12 +162,10 @@ static OotPspPinnedAssetWindowCache sOotPspPinnedAssetCaches[] = {
     { OOT_PSP_AUDIOBANK_ASSET_NAME, { NULL, NULL, 0, 0, 0, 0, false, false } },
     { OOT_PSP_AUDIOSEQ_ASSET_NAME, { NULL, NULL, 0, 0, 0, 0, false, false } },
 };
-static OotPspAssetWindowCache sOotPspHotAssetCaches[OOT_PSP_HOT_ASSET_CACHE_COUNT];
-static OotPspHotReadTracker sOotPspHotReadTrackers[OOT_PSP_HOT_READ_TRACKER_COUNT];
-
 #define OOT_PSP_PINNED_ASSET_CACHE_COUNT (sizeof(sOotPspPinnedAssetCaches) / sizeof(sOotPspPinnedAssetCaches[0]))
 
 static void OotPsp_ClearPackedAssetCache(void);
+static void OotPsp_InitPackedAssetCache(void);
 static void OotPsp_ClosePackedAssetFile(void);
 static void OotPsp_PreloadPersistentAssets(void);
 static void OotPsp_ForgetNativeTextureRangeCache(const OotPspLoadedAssetRange* range);
@@ -457,6 +448,13 @@ s32 OotPsp_AssetInit(const char* executablePath) {
     }
     OotPsp_InitAssetSema();
     OotPsp_PreloadPersistentAssets();
+
+    /*
+     * Claim the remaining volatile-memory budget for the general packed-block
+     * cache during initialization. The removed hot cache can no longer consume
+     * this pool later, and the first scene load no longer pays cache allocation.
+     */
+    OotPsp_InitPackedAssetCache();
     return true;
 }
 
@@ -641,7 +639,14 @@ static OotPspAssetWindowCache* OotPsp_FindPinnedAssetCache(const OotPspExternalA
         OotPspPinnedAssetWindowCache* pinned = &sOotPspPinnedAssetCaches[i];
         OotPspAssetWindowCache* cache = &pinned->cache;
 
-        if (OotPsp_AssetNameEquals(asset, pinned->name)) {
+        /* Runtime reads overwhelmingly target non-pinned assets. Once preload
+         * has resolved a pinned entry, use pointer identity and avoid five
+         * strcmp calls on every ordinary asset read. */
+        if (cache->asset == asset) {
+            return cache->loading ? NULL : cache;
+        }
+
+        if ((cache->asset == NULL) && OotPsp_AssetNameEquals(asset, pinned->name)) {
             if (cache->loading) {
                 return NULL;
             }
@@ -653,127 +658,8 @@ static OotPspAssetWindowCache* OotPsp_FindPinnedAssetCache(const OotPspExternalA
     return NULL;
 }
 
-static OotPspAssetWindowCache* OotPsp_FindLoadedHotAssetCache(const OotPspExternalAsset* asset) {
-    size_t i;
-
-    for (i = 0; i < OOT_PSP_HOT_ASSET_CACHE_COUNT; i++) {
-        OotPspAssetWindowCache* cache = &sOotPspHotAssetCaches[i];
-
-        if ((cache->asset == asset) && (cache->data != NULL) && !cache->loading) {
-            return cache;
-        }
-    }
-
-    return NULL;
-}
-
 static OotPspAssetWindowCache* OotPsp_FindAssetCache(const OotPspExternalAsset* asset) {
-    OotPspAssetWindowCache* cache = OotPsp_FindPinnedAssetCache(asset);
-
-    if (cache != NULL) {
-        return cache;
-    }
-
-    return OotPsp_FindLoadedHotAssetCache(asset);
-}
-
-static s32 OotPsp_IsHotAssetCache(const OotPspAssetWindowCache* cache) {
-    size_t i;
-
-    for (i = 0; i < OOT_PSP_HOT_ASSET_CACHE_COUNT; i++) {
-        if (cache == &sOotPspHotAssetCaches[i]) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static s32 OotPsp_IsAudioAsset(const OotPspExternalAsset* asset) {
-    return (asset != NULL) &&
-           (OotPsp_AssetNameEquals(asset, OOT_PSP_AUDIOBANK_ASSET_NAME) ||
-            OotPsp_AssetNameEquals(asset, OOT_PSP_AUDIOSEQ_ASSET_NAME) ||
-            OotPsp_AssetNameEquals(asset, OOT_PSP_AUDIOTABLE_ASSET_NAME));
-}
-
-static s32 OotPsp_RecordHotAssetRead(const OotPspExternalAsset* asset) {
-    OotPspHotReadTracker* best = NULL;
-    size_t i;
-
-    if ((asset == NULL) || OotPsp_IsAudioAsset(asset)) {
-        return false;
-    }
-
-    for (i = 0; i < OOT_PSP_HOT_READ_TRACKER_COUNT; i++) {
-        OotPspHotReadTracker* tracker = &sOotPspHotReadTrackers[i];
-
-        if (tracker->asset == asset) {
-            if (tracker->hits < 0xFF) {
-                tracker->hits++;
-            }
-            tracker->lastUsed = OotPsp_NextAssetCacheClock();
-            return tracker->hits >= OOT_PSP_HOT_READ_PROMOTE_COUNT;
-        }
-
-        if (tracker->asset == NULL) {
-            best = tracker;
-        } else if ((best == NULL) || (tracker->lastUsed < best->lastUsed)) {
-            best = tracker;
-        }
-    }
-
-    if (best == NULL) {
-        return false;
-    }
-
-    best->asset = asset;
-    best->hits = 1;
-    best->lastUsed = OotPsp_NextAssetCacheClock();
-    return false;
-}
-
-static OotPspAssetWindowCache* OotPsp_GetHotAssetCacheCandidate(const OotPspExternalAsset* asset) {
-    OotPspAssetWindowCache* best = NULL;
-    size_t i;
-
-    if (asset == NULL) {
-        return NULL;
-    }
-
-    for (i = 0; i < OOT_PSP_HOT_ASSET_CACHE_COUNT; i++) {
-        OotPspAssetWindowCache* cache = &sOotPspHotAssetCaches[i];
-
-        if (cache->loading) {
-            continue;
-        }
-
-        if (cache->asset == asset) {
-            return cache;
-        }
-
-        if (cache->asset == NULL) {
-            best = cache;
-        } else if ((best == NULL) || (cache->lastUsed < best->lastUsed)) {
-            best = cache;
-        }
-    }
-
-    if (best == NULL) {
-        return NULL;
-    }
-
-    if ((best->asset != NULL) && (best->asset != asset)) {
-        OotPsp_FreeCacheMemory(best->data);
-        best->data = NULL;
-        best->capacity = 0;
-        best->offset = 0;
-        best->dataSize = 0;
-        best->failed = false;
-    }
-
-    best->asset = asset;
-    best->lastUsed = OotPsp_NextAssetCacheClock();
-    return best;
+    return OotPsp_FindPinnedAssetCache(asset);
 }
 
 static s32 OotPsp_ReadPackedOpenFileRange(SceUID fd, const char* path, size_t offset, u8* out, size_t size,
@@ -1072,7 +958,7 @@ static s32 OotPsp_ReadPackedAssetFileRange(const OotPspExternalAsset* asset, siz
     }
 
     maxReadChunk = (size >= OOT_PSP_PACKED_DIRECT_READ_MIN_SIZE)
-                       ? OOT_PSP_PACKED_CACHE_BLOCK_SIZE
+                       ? OOT_PSP_PACKED_DIRECT_READ_CHUNK_SIZE
                        : (allowAudioYield ? OOT_PSP_ASSET_READ_CHUNK_SIZE
                                           : OOT_PSP_PACKED_CACHE_BLOCK_SIZE);
     return OotPsp_ReadPackedOpenFileRange(fd, path, packedOffset, out, size, maxReadChunk, allowAudioYield);
@@ -1159,8 +1045,7 @@ static s32 OotPsp_EnsureAssetCacheRange(OotPspAssetWindowCache* cache, const Oot
             return false;
         }
 
-        data = OotPsp_IsHotAssetCache(cache) ? OotPsp_AllocVolatileCacheMemory(capacity)
-                                             : OotPsp_AllocCacheMemory(capacity);
+        data = OotPsp_AllocCacheMemory(capacity);
         if (data == NULL) {
             printf("oot-psp asset cache alloc failed name=%s size=%lu\n", OotPsp_AssetName(asset),
                    (unsigned long)capacity);
@@ -1574,6 +1459,16 @@ static void OotPsp_ClearLoadedAssetRange(void* ram, size_t size) {
 
     cleared = OotPsp_ClearLoadedAssetSerialRanges(ramStart, ramEnd);
 
+    /*
+     * Every detailed loaded-range entry belongs to a serial-indexed base range.
+     * If the complete serial index proves this destination does not overlap any
+     * loaded asset, there cannot be a live detailed range to invalidate either.
+     * Avoid the 4K-entry scan on the common "new destination" load path.
+     */
+    if (!cleared && sOotPspLoadedAssetSerialRangeIndexComplete) {
+        return;
+    }
+
     for (i = 0; i < sOotPspLoadedAssetRangeHighWater; i++) {
         OotPspLoadedAssetRange* range = &sOotPspLoadedAssetRanges[i];
 
@@ -1584,6 +1479,9 @@ static void OotPsp_ClearLoadedAssetRange(void* ram, size_t size) {
             range->assetOffsetStart = 0;
             range->flags = 0;
             range->serial = 0;
+            if (sOotPspLoadedAssetRangeFreeSlotCount < OOT_PSP_LOADED_ASSET_RANGE_COUNT) {
+                sOotPspLoadedAssetRangeFreeSlots[sOotPspLoadedAssetRangeFreeSlotCount++] = (u16)i;
+            }
             cleared = true;
         }
     }
@@ -1598,32 +1496,28 @@ static void OotPsp_StoreLoadedAssetRange(void* ram, size_t size, uintptr_t asset
     OotPspLoadedAssetRange* range;
     uintptr_t ramStart;
     uintptr_t ramEnd;
-    size_t i;
-    size_t slot = OOT_PSP_LOADED_ASSET_RANGE_COUNT;
+    size_t slot;
 
     if (!OotPsp_RamRangeFromPtr(ram, size, &ramStart, &ramEnd)) {
         return;
     }
 
-    for (i = 0; i < OOT_PSP_LOADED_ASSET_RANGE_COUNT; i++) {
-        size_t candidate = sOotPspLoadedAssetRangeNext + i;
-
-        if (candidate >= OOT_PSP_LOADED_ASSET_RANGE_COUNT) {
-            candidate -= OOT_PSP_LOADED_ASSET_RANGE_COUNT;
-        }
-        if (sOotPspLoadedAssetRanges[candidate].ramStart == sOotPspLoadedAssetRanges[candidate].ramEnd) {
-            slot = candidate;
-            break;
-        }
-    }
-
-    if (slot == OOT_PSP_LOADED_ASSET_RANGE_COUNT) {
+    /*
+     * The old allocator linearly searched up to all 4096 entries looking for a
+     * cleared slot on every registration. Scene loads can register many texture
+     * subranges, so that search became a CPU-side loading stall once the table
+     * filled. Reuse explicitly freed slots first, then grow high-water
+     * sequentially, and only use the ring victim once all slots have been used.
+     */
+    if (sOotPspLoadedAssetRangeFreeSlotCount != 0) {
+        slot = sOotPspLoadedAssetRangeFreeSlots[--sOotPspLoadedAssetRangeFreeSlotCount];
+    } else if (sOotPspLoadedAssetRangeHighWater < OOT_PSP_LOADED_ASSET_RANGE_COUNT) {
+        slot = sOotPspLoadedAssetRangeHighWater++;
+    } else {
         slot = sOotPspLoadedAssetRangeNext;
     }
+
     sOotPspLoadedAssetRangeNext = (slot + 1) % OOT_PSP_LOADED_ASSET_RANGE_COUNT;
-    if (slot >= sOotPspLoadedAssetRangeHighWater) {
-        sOotPspLoadedAssetRangeHighWater = slot + 1;
-    }
 
     range = &sOotPspLoadedAssetRanges[slot];
     if (range->serial != 0) {
@@ -1895,11 +1789,11 @@ static s32 OotPsp_TryReadAssetCache(const OotPspExternalAsset* asset, void* ram,
     }
 
     cache = OotPsp_FindAssetCache(asset);
-    offset = vrom - asset->vromStart;
-    if ((cache == NULL) && (size <= OOT_PSP_HOT_READ_MAX_SIZE) && OotPsp_RecordHotAssetRead(asset)) {
-        cache = OotPsp_GetHotAssetCacheCandidate(asset);
+    if (cache == NULL) {
+        return false;
     }
 
+    offset = vrom - asset->vromStart;
     if (!OotPsp_EnsureAssetCacheRange(cache, asset, offset, size, allowAudioYield)) {
         return false;
     }
