@@ -3391,7 +3391,14 @@ static void gfx_prepare_tri_pipeline_state(void) {
     state->two_texture_blend = rdp.combine_two_texture_blend;
     state->two_texture_blend_uses_prim_lod = rdp.combine_two_texture_blend_uses_prim_lod;
     state->two_texture_alpha_blend = rdp.combine_two_texture_alpha_blend;
-    state->fog_uses_texture_alpha = use_fog && comb->uses_texture_alpha;
+    /* Texture-edge pixels become fully opaque after passing the alpha test.
+     * When the base pass writes depth, GU_EQUAL already gives the fog pass the
+     * exact same cutout mask. Sampling texture alpha again would attenuate fog
+     * at bilinear-filtered silhouettes and leave visible seams around trees,
+     * fences, and similar cards. Non-depth-writing cutouts and translucent
+     * materials still need texture alpha to mask the separate fog pass. */
+    state->fog_uses_texture_alpha =
+        use_fog && comb->uses_texture_alpha && !(texture_edge && depth_test && z_upd);
     state->flame_texture_atlas = flame_texture_atlas;
     state->texture_tint_colors_corrected = textureTintColorsCorrected;
     state->two_texture_uncompensated_alpha = twoTextureUncompensatedAlpha;
