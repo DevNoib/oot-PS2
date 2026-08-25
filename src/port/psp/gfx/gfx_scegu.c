@@ -864,7 +864,7 @@ static const char* const sHomeMenuAboutLines[] = {
     "",
     "Special thanks:",
     "Original SM64 Fast3d renderer: Mr.Neo240",
-    "R&D Team: M-CID and the PSP Homebrew community",
+    "R&D Team: M-CID and the PSP community",
     "Daedalus Team: Wally, Re4thewin, Dreamer72",
     "Discord Team: Mr. Iron, Acid_Snake, Krazynez",
     "N64 Decompilation Team",
