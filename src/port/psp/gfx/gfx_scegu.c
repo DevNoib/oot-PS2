@@ -987,9 +987,10 @@ static void gfx_scegu_render_controller_mapping(int selectedIndex, const char* s
     char value[96];
     int bindingCount = OotPspControls_GetBindingCount();
     int deadzoneRow = bindingCount;
-    int saveRow = bindingCount + 1;
-    int resetRow = bindingCount + 2;
-    int backRow = bindingCount + 3;
+    int n64StickScalingRow = bindingCount + 1;
+    int saveRow = bindingCount + 2;
+    int resetRow = bindingCount + 3;
+    int backRow = bindingCount + 4;
     int totalRows = backRow + 1;
     int visibleRows = 7;
     int firstRow = selectedIndex - (visibleRows / 2);
@@ -1030,6 +1031,9 @@ static void gfx_scegu_render_controller_mapping(int selectedIndex, const char* s
                 snprintf(line, sizeof(line), "%s: %.32s", OotPspControls_GetBindingName(row), value);
             } else if (row == deadzoneRow) {
                 snprintf(line, sizeof(line), "Deadzone: %d", OotPspControls_GetDeadzone());
+            } else if (row == n64StickScalingRow) {
+                snprintf(line, sizeof(line), "N64 Stick Scaling: %s",
+                         OotPspControls_IsN64StickScalingEnabled() ? "On" : "Off");
             } else if (row == saveRow) {
                 snprintf(line, sizeof(line), "Save controls.ini");
             } else if (row == resetRow) {

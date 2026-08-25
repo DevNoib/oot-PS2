@@ -95,20 +95,24 @@ static int OotPspHomeMenu_ControlDeadzoneRow(void) {
     return OotPspControls_GetBindingCount();
 }
 
-static int OotPspHomeMenu_ControlSaveRow(void) {
+static int OotPspHomeMenu_ControlN64StickScalingRow(void) {
     return OotPspControls_GetBindingCount() + 1;
 }
 
-static int OotPspHomeMenu_ControlResetRow(void) {
+static int OotPspHomeMenu_ControlSaveRow(void) {
     return OotPspControls_GetBindingCount() + 2;
 }
 
-static int OotPspHomeMenu_ControlBackRow(void) {
+static int OotPspHomeMenu_ControlResetRow(void) {
     return OotPspControls_GetBindingCount() + 3;
 }
 
-static int OotPspHomeMenu_ControlRowCount(void) {
+static int OotPspHomeMenu_ControlBackRow(void) {
     return OotPspControls_GetBindingCount() + 4;
+}
+
+static int OotPspHomeMenu_ControlRowCount(void) {
+    return OotPspControls_GetBindingCount() + 5;
 }
 
 static void OotPspHomeMenu_SetStatus(const char* message) {
@@ -134,6 +138,8 @@ static void OotPspHomeMenu_AdjustControlRow(int direction) {
         OotPspControls_CycleBinding(sControlSelectedIndex, direction);
     } else if (sControlSelectedIndex == OotPspHomeMenu_ControlDeadzoneRow()) {
         OotPspControls_AdjustDeadzone(direction * 2);
+    } else if (sControlSelectedIndex == OotPspHomeMenu_ControlN64StickScalingRow()) {
+        OotPspControls_SetN64StickScalingEnabled(!OotPspControls_IsN64StickScalingEnabled());
     }
 }
 
@@ -142,6 +148,8 @@ static void OotPspHomeMenu_ActivateControlRow(void) {
         OotPspControls_CycleBinding(sControlSelectedIndex, 1);
     } else if (sControlSelectedIndex == OotPspHomeMenu_ControlDeadzoneRow()) {
         OotPspControls_AdjustDeadzone(2);
+    } else if (sControlSelectedIndex == OotPspHomeMenu_ControlN64StickScalingRow()) {
+        OotPspControls_SetN64StickScalingEnabled(!OotPspControls_IsN64StickScalingEnabled());
     } else if (sControlSelectedIndex == OotPspHomeMenu_ControlSaveRow()) {
         if (OotPspControls_Save() == 0) {
             OotPspHomeMenu_SetStatus("Saved controls.ini");
