@@ -140,6 +140,10 @@ static DamageTable sDamageTable = {
 };
 
 static s32 sNumSpawned = 0;
+#if PLATFORM_PSP
+// PSP actor overlays are linked permanently, so their mutable state does not reset when the last actor unloads.
+static s32 sNumActive = 0;
+#endif
 
 static Vec3f sFieldMiddle = { -1000.0f, 0.0f, 6500.0f };
 
@@ -169,6 +173,11 @@ void EnPoField_Init(Actor* thisx, PlayState* play) {
     EnPoField* this = (EnPoField*)thisx;
     s32 pad;
 
+#if PLATFORM_PSP
+    if (sNumActive == 0) {
+        sNumSpawned = 0;
+    }
+#endif
     if (sNumSpawned != 10) {
         sSpawnPositions[sNumSpawned].x = this->actor.world.pos.x;
         sSpawnPositions[sNumSpawned].y = this->actor.world.pos.y;
@@ -181,6 +190,9 @@ void EnPoField_Init(Actor* thisx, PlayState* play) {
         Actor_Kill(&this->actor);
         return;
     }
+#if PLATFORM_PSP
+    sNumActive++;
+#endif
     Actor_ProcessInitChain(&this->actor, sInitChain);
     SkelAnime_Init(play, &this->skelAnime, &gPoeFieldSkel, &gPoeFieldFloatAnim, this->jointTable, this->morphTable, 10);
     Collider_InitCylinder(play, &this->collider);
@@ -199,6 +211,9 @@ void EnPoField_Destroy(Actor* thisx, PlayState* play) {
     EnPoField* this = (EnPoField*)thisx;
 
     if (this->actor.params != 0xFF) {
+#if PLATFORM_PSP
+        sNumActive--;
+#endif
         LightContext_RemoveLight(play, &play->lightCtx, this->lightNode);
         Collider_DestroyCylinder(play, &this->flameCollider);
         Collider_DestroyCylinder(play, &this->collider);
