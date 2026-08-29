@@ -3312,7 +3312,8 @@ void Message_DrawMain(PlayState* play, Gfx** p) {
                     msgCtx->msgMode = MSGMODE_OCARINA_FAIL;
                 } else if (CHECK_BTN_ALL(input->press.button, BTN_B)
 #if PLATFORM_PSP
-                           || (msgCtx->ocarinaAction == OCARINA_ACTION_FREE_PLAY &&
+                           || ((msgCtx->ocarinaAction == OCARINA_ACTION_FREE_PLAY ||
+                                msgCtx->ocarinaAction >= OCARINA_ACTION_CHECK_SARIA) &&
                                CHECK_BTN_ALL(input->cur.button, BTN_B))
 #endif
                 ) {
