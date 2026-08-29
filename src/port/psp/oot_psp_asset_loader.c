@@ -41,6 +41,7 @@
 #define OOT_PSP_KANJI_ASSET_NAME            "kanji"
 #define OOT_PSP_LINK_ANIMATION_ASSET_NAME   "link_animetion"
 #define OOT_PSP_AUDIOTABLE_ASSET_NAME       "Audiotable"
+#define OOT_PSP_DO_ACTION_ASSET_NAME         "do_action_static"
 #define OOT_PSP_ASSET_READ_ZERO_RETRY_COUNT 16
 #define OOT_PSP_ASSET_READ_ZERO_RETRY_USEC  1000
 #define OOT_PSP_AUDIO_READ_BACKOFF_USEC     1000
@@ -161,6 +162,7 @@ static OotPspPinnedAssetWindowCache sOotPspPinnedAssetCaches[] = {
     { OOT_PSP_AUDIOTABLE_ASSET_NAME, { NULL, NULL, 0, 0, 0, 0, false, false } },
     { OOT_PSP_AUDIOBANK_ASSET_NAME, { NULL, NULL, 0, 0, 0, 0, false, false } },
     { OOT_PSP_AUDIOSEQ_ASSET_NAME, { NULL, NULL, 0, 0, 0, 0, false, false } },
+    { OOT_PSP_DO_ACTION_ASSET_NAME, { NULL, NULL, 0, 0, 0, 0, false, false } },
 };
 #define OOT_PSP_PINNED_ASSET_CACHE_COUNT (sizeof(sOotPspPinnedAssetCaches) / sizeof(sOotPspPinnedAssetCaches[0]))
 
