@@ -5324,8 +5324,12 @@ static GFX_DL_HANDLER void gfx_dp_set_combine(uint32_t w0, uint32_t w1) {
         }
     }
 
-    if (twoTextureBlend &&
+    if (((rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE) &&
         gfx_cc_is_combined_mul_environment(alphaA1, alphaB1, alphaC1, alphaD1)) {
+        /* Cycle two modulates the first cycle's alpha by ENVIRONMENT. The GU only evaluates the
+         * compacted first-cycle combiner, so apply that multiplier to the emitted vertex alpha.
+         * Among other uses, the Gerudo Training Ground eye statues set ENVIRONMENT alpha to zero
+         * until they have been hit. */
         alphaMulEnv = true;
     }
 
