@@ -2079,9 +2079,6 @@ static void gfx_scegu_end_frame(void) {
 
     sceGuFinish();
     sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
-#if OOT_PSP_WAIT_VBLANK
-    sceDisplayWaitVblankStart();
-#endif
     if (sInterlacedOutput) {
         gfx_scegu_present_interlaced();
     } else {
