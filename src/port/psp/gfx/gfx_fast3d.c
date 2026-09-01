@@ -194,6 +194,7 @@ struct ColorCombiner {
     uint8_t used_textures[2];
     int8_t active_texture;
     uint8_t vertex_color_source[2];
+    uint8_t texture_blend_color_source;
     bool texture_blend;
     bool uses_texture_alpha;
 } __attribute__((packed, aligned(4)));
@@ -1686,7 +1687,24 @@ static void gfx_generate_cc(struct ColorCombiner *comb, uint32_t cc_id) {
         gfx_cc_pick_vertex_color_source(c[1], shader_input_mapping[1], shader_input_count[1]);
     comb->texture_blend = cc_features.opt_texture_blend;
     if (cc_features.opt_texture_blend) {
-        comb->vertex_color_source[0] = cc_features.opt_texture_blend_shade ? CC_SHADE : CC_ENV;
+        if (cc_features.opt_texture_blend_shade) {
+            comb->vertex_color_source[0] = CC_SHADE;
+            comb->texture_blend_color_source = CC_PRIM;
+        } else {
+            comb->vertex_color_source[0] = CC_ENV;
+            comb->texture_blend_color_source = CC_PRIM;
+
+            /* Double Defense hearts reverse the usual UI endpoints. GU_TFX_BLEND
+             * interpolates from the vertex color in D to the texture-environment
+             * color in A using the texture intensity. */
+            if ((c[0][0] == CC_ENV) && (c[0][1] == CC_PRIM) && (c[0][2] == CC_TEXEL0) &&
+                (c[0][3] == CC_PRIM)) {
+                comb->vertex_color_source[0] = CC_PRIM;
+                comb->texture_blend_color_source = CC_ENV;
+            }
+        }
+    } else {
+        comb->texture_blend_color_source = CC_0;
     }
 }
 
@@ -3270,6 +3288,7 @@ static void gfx_prepare_tri_pipeline_state(void) {
     struct ShaderProgram *prg = comb->prg;
     struct RGBA textureTintPrimColor = rdp.prim_color;
     struct RGBA textureTintEnvColor = rdp.env_color;
+    struct RGBA* textureBlendColor = &textureTintPrimColor;
     bool textureTintColorsCorrected = false;
     bool twoTextureUncompensatedAlpha = false;
 #if defined(TARGET_PSP)
@@ -3291,6 +3310,9 @@ static void gfx_prepare_tri_pipeline_state(void) {
             &textureTintEnvColor);
     }
 #endif
+    if (comb->texture_blend_color_source == CC_ENV) {
+        textureBlendColor = &textureTintEnvColor;
+    }
     if (backend_state_dirty || prg != rendering_state.shader_program) {
         gfx_flush();
         gfx_rapi->unload_shader(backend_state_dirty ? NULL : rendering_state.shader_program);
@@ -3304,15 +3326,14 @@ static void gfx_prepare_tri_pipeline_state(void) {
     }
     if (comb->texture_blend &&
         (backend_state_dirty || !rendering_state.texture_env_color_valid ||
-         (rendering_state.texture_env_color.r != textureTintPrimColor.r) ||
-         (rendering_state.texture_env_color.g != textureTintPrimColor.g) ||
-         (rendering_state.texture_env_color.b != textureTintPrimColor.b))) {
+         (rendering_state.texture_env_color.r != textureBlendColor->r) ||
+         (rendering_state.texture_env_color.g != textureBlendColor->g) ||
+         (rendering_state.texture_env_color.b != textureBlendColor->b))) {
         gfx_flush();
         /* GU_TFX_BLEND uses only the texture-environment RGB. Flame opacity is already emitted per vertex, so
          * changing primitive alpha (as every Poe trail element does) must not split the triangle batch. */
-        gfx_rapi->set_texture_env_color(textureTintPrimColor.r, textureTintPrimColor.g, textureTintPrimColor.b,
-                                        0xFF);
-        rendering_state.texture_env_color = textureTintPrimColor;
+        gfx_rapi->set_texture_env_color(textureBlendColor->r, textureBlendColor->g, textureBlendColor->b, 0xFF);
+        rendering_state.texture_env_color = *textureBlendColor;
         rendering_state.texture_env_color.a = 0xFF;
         rendering_state.texture_env_color_valid = true;
     }
@@ -5093,8 +5114,12 @@ static bool gfx_cc_is_alpha_two_texture_blend(uint32_t a, uint32_t b, uint32_t c
 }
 
 static bool gfx_cc_is_texture_prim_env_blend(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
-    return (a == G_CCMUX_PRIMITIVE) && (b == G_CCMUX_ENVIRONMENT) && (c == G_CCMUX_TEXEL0) &&
-           (d == G_CCMUX_ENVIRONMENT);
+    if (c != G_CCMUX_TEXEL0) {
+        return false;
+    }
+
+    return ((a == G_CCMUX_PRIMITIVE) && (b == G_CCMUX_ENVIRONMENT) && (d == G_CCMUX_ENVIRONMENT)) ||
+           ((a == G_CCMUX_ENVIRONMENT) && (b == G_CCMUX_PRIMITIVE) && (d == G_CCMUX_PRIMITIVE));
 }
 
 static bool gfx_cc_is_color_mul(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t lhs, uint32_t rhs) {
