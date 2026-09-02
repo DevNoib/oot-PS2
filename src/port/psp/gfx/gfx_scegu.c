@@ -236,6 +236,7 @@ enum MixType {
 
 struct ShaderProgram {
     bool enabled;
+    bool cache_valid;
     uint32_t shader_id;
     struct CCFeatures cc;
     enum MixType mix;
@@ -243,6 +244,9 @@ struct ShaderProgram {
     int texture_ord[2];
     int num_inputs;
 };
+
+#define SHADER_PROGRAM_CACHE_CAPACITY 256
+#define SHADER_PROGRAM_CACHE_MASK (SHADER_PROGRAM_CACHE_CAPACITY - 1)
 
 struct SamplerState {
     int min_filter;
@@ -278,8 +282,11 @@ typedef struct VertexColor {
     unsigned short x, y, z;
 } VertexColor;
 
-static struct ShaderProgram shader_program_pool[64];
-static uint8_t shader_program_pool_size;
+/* Color combiners retain ShaderProgram pointers, so cache entries must never
+ * move or be evicted. Open addressing keeps those pointers stable while
+ * avoiding an increasingly expensive linear scan during long play sessions. */
+static struct ShaderProgram shader_program_cache[SHADER_PROGRAM_CACHE_CAPACITY];
+static uint16_t shader_program_cache_count;
 static struct ShaderProgram *cur_shader = NULL;
 static struct ShaderProgram *sAppliedShader = NULL;
 static struct SamplerState tmu_state[2];
@@ -310,6 +317,34 @@ static void *sHomeMenuBgBlurScratch;
 static intraFont *sHomeMenuFont;
 static bool sHomeMenuFontInitTried;
 #endif
+
+static struct ShaderProgram *gfx_scegu_probe_shader_cache(uint32_t shader_id, bool *found) {
+    size_t cacheIndex = (shader_id * 0x9E3779B1U) >> 24;
+
+    for (size_t probe = 0; probe < SHADER_PROGRAM_CACHE_CAPACITY; probe++) {
+        struct ShaderProgram *prg = &shader_program_cache[cacheIndex];
+
+        if (!prg->cache_valid) {
+            *found = false;
+            return prg;
+        }
+        if (prg->shader_id == shader_id) {
+            *found = true;
+            return prg;
+        }
+        cacheIndex = (cacheIndex + 1) & SHADER_PROGRAM_CACHE_MASK;
+    }
+
+    *found = false;
+    return NULL;
+}
+
+static struct ShaderProgram *gfx_scegu_lookup_shader(uint32_t shader_id) {
+    bool found;
+    struct ShaderProgram *prg = gfx_scegu_probe_shader_cache(shader_id, &found);
+
+    return found ? prg : NULL;
+}
 
 static void *gfx_scegu_vram_cpu_addr(const void *vramBuffer) {
     return (void *)(((uintptr_t)sceGeEdramGetAddr() | 0x40000000U) + ((uintptr_t)vramBuffer & 0x00FFFFFFU));
@@ -1175,13 +1210,7 @@ static inline bool is_shader_enabled(uint32_t id) {
 }
 
 static struct ShaderProgram *get_shader_from_id(uint32_t id) {
-    size_t i;
-    for (i = 0; i < shader_program_pool_size; i++) {
-        if (shader_program_pool[i].shader_id == id) {
-            return &shader_program_pool[i];
-        }
-    }
-    return NULL;
+    return gfx_scegu_lookup_shader(id);
 }
 
 static bool gfx_scegu_z_is_from_0_to_1(void) {
@@ -1346,15 +1375,28 @@ static void gfx_scegu_load_shader(struct ShaderProgram *new_prg) {
 
 static struct ShaderProgram *gfx_scegu_create_and_load_new_shader(uint32_t shader_id) {
     struct CCFeatures ccf;
-    gfx_cc_get_features(shader_id, &ccf);
+    bool found;
+    struct ShaderProgram *prg = gfx_scegu_probe_shader_cache(shader_id, &found);
 
-    struct ShaderProgram *prg = &shader_program_pool[shader_program_pool_size++];
+    if (found) {
+        gfx_scegu_load_shader(prg);
+        return prg;
+    }
+    if ((prg == NULL) || (shader_program_cache_count >= SHADER_PROGRAM_CACHE_CAPACITY)) {
+        static const char message[] = "Shader program cache exhausted!\n";
+
+        sceIoWrite(1, message, sizeof(message) - 1);
+        abort();
+    }
+
+    gfx_cc_get_features(shader_id, &ccf);
 
     prg->shader_id = shader_id;
     prg->cc = ccf;
     prg->num_inputs = ccf.num_inputs;
     prg->texture_used[0] = ccf.used_textures[0] || ccf.used_textures[1];
     prg->texture_used[1] = false;
+    prg->mix = SH_MT_NONE;
 
     if (prg->texture_used[0] && ccf.num_inputs) {
         prg->mix = SH_MT_TEXTURE_COLOR;
@@ -1367,19 +1409,12 @@ static struct ShaderProgram *gfx_scegu_create_and_load_new_shader(uint32_t shade
     }
 
     prg->enabled = false;
+    prg->cache_valid = true;
+    shader_program_cache_count++;
 
     gfx_scegu_load_shader(prg);
 
     return prg;
-}
-
-static struct ShaderProgram *gfx_scegu_lookup_shader(uint32_t shader_id) {
-    for (size_t i = 0; i < shader_program_pool_size; i++) {
-        if (shader_program_pool[i].shader_id == shader_id) {
-            return &shader_program_pool[i];
-        }
-    }
-    return NULL;
 }
 
 static void gfx_scegu_shader_get_info(struct ShaderProgram *prg, uint8_t *num_inputs, bool used_textures[2]) {
