@@ -1701,6 +1701,8 @@ PS2DEV ?= /usr/local/ps2dev
 PS2SDK ?= $(PS2DEV)/ps2sdk
 GSKIT ?= $(PS2DEV)/gsKit
 PS2_PORT_BUILD_DIR ?= build/ps2-port/$(VERSION)
+PS2_PORT_PYTHON ?= python3
+PS2_PORT_PYTHON_ENV := PYTHONPATH=tools/ps2:.
 PS2_PORT_CC := $(PS2DEV)/ee/bin/mips64r5900el-ps2-elf-gcc
 PS2_PORT_AR := $(PS2DEV)/ee/bin/mips64r5900el-ps2-elf-ar
 PS2_PORT_NM := $(PS2DEV)/ee/bin/mips64r5900el-ps2-elf-nm
@@ -1712,10 +1714,10 @@ PS2_PORT_RUNTIME_ASM_SOURCES := \
 PS2_PORT_ASSET_SNAPSHOT := assets/ps2/$(VERSION)/generated.zip
 PS2_PORT_ASSET_TRANSFORM := assets/ps2/$(VERSION)/asset_transform.z
 PS2_PORT_RUNTIME_PATCH_MANIFEST := assets/ps2/$(VERSION)/runtime_patches.z
-PS2_PORT_SNAPSHOT_TOOL := tools/ps2/port_asset_snapshot.py
-PS2_PORT_RUNTIME_PATCH_TOOL := tools/ps2/psp_port_runtime_patches.py
-PS2_PORT_PACK_ASSETS_TOOL := tools/ps2/ps2_port_pack_assets.py
+PS2_PORT_SNAPSHOT_TOOL := tools/psp_port_asset_snapshot.py
+PS2_PORT_RUNTIME_PATCH_TOOL := tools/ps2_port_runtime_patches.py
 PS2_PORT_SETUP_STAMP := $(PS2_PORT_BUILD_DIR)/setup.stamp
+PS2_PORT_INCLUDE_DIR := $(PS2_PORT_BUILD_DIR)/include
 PS2_PORT_ROMINFO_SOURCE := $(PS2_PORT_BUILD_DIR)/oot_port_rominfo.c
 PS2_PORT_ROMINFO_OBJECT := $(PS2_PORT_BUILD_DIR)/oot_port_rominfo.o
 PS2_PORT_ASSET_TABLE_SOURCE := $(PS2_PORT_BUILD_DIR)/oot_port_asset_tables.c
@@ -1735,8 +1737,6 @@ PS2_PORT_BASE_ELF := $(PS2_PORT_BUILD_DIR)/oot-ps2.base.elf
 PS2_PORT_RUNTIME_PATCH_BLOB := $(PS2_PORT_BUILD_DIR)/oot_ps2_runtime_patches.bin
 PS2_PORT_RUNTIME_PATCH_ASM := $(PS2_PORT_BUILD_DIR)/oot_ps2_runtime_patches.S
 PS2_PORT_RUNTIME_PATCH_OBJECT := $(PS2_PORT_BUILD_DIR)/oot_ps2_runtime_patches.o
-PS2_PORT_BASEROM := baseroms/$(VERSION)/baserom.z64
-PS2_PORT_PACKED_ASSETS := $(PS2_PORT_BUILD_DIR)/oot_ps2_assets.bin
 PS2_PORT_DEP_FILES := $(PS2_PORT_RUNTIME_OBJECTS:.o=.d) $(PS2_PORT_RUNTIME_ASM_OBJECTS:.o=.d) \
 	$(PS2_PORT_ENTRY_OBJECT:.o=.d) $(PS2_PORT_ROMINFO_OBJECT:.o=.d) $(PS2_PORT_ASSET_TABLE_OBJECT:.o=.d) \
 	$(PS2_PORT_AUDIO_TABLE_OBJECT:.o=.d) $(PS2_PORT_ASSET_SEGMENT_OBJECT:.o=.d) \
@@ -1768,8 +1768,8 @@ PS2_PORT_DEFINES := \
 PS2_PORT_ASM_DEFINES := -D_MIPS_SIM=_ABIO32 -D_LANGUAGE_ASSEMBLY
 
 PS2_PORT_INCLUDES := \
-	-Iinclude \
-	-Iinclude/libc \
+	-I$(PS2_PORT_INCLUDE_DIR)/libc \
+	-I$(PS2_PORT_INCLUDE_DIR) \
 	-Isrc \
 	-I. \
 	-I$(EXTRACTED_DIR) \
@@ -1785,7 +1785,7 @@ PS2_PORT_INCLUDES := \
 PS2_PORT_CFLAGS := -G0 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-missing-braces \
 	-Wno-int-to-pointer-cast -Wno-pointer-to-int-cast -ffunction-sections -fdata-sections \
 	-fno-strict-aliasing -fwrapv -fsigned-char $(PS2_PORT_DEFINES) $(PS2_PORT_INCLUDES)
-PS2_PORT_ASM_FLAGS := -G0 $(PS2_PORT_ASM_DEFINES) -Iinclude -Iinclude/libc -I. -I$(BUILD_DIR) \
+PS2_PORT_ASM_FLAGS := -G0 $(PS2_PORT_ASM_DEFINES) -I$(PS2_PORT_INCLUDE_DIR)/libc -I$(PS2_PORT_INCLUDE_DIR) -I. -I$(BUILD_DIR) \
 	-I$(EXTRACTED_DIR) -I$(PS2SDK)/ee/include -I$(PS2SDK)/common/include
 PS2_PORT_LIBS := -L$(GSKIT)/lib -L$(PS2SDK)/ee/lib -L$(PS2SDK)/ports/lib \
 	-lgskit -ldmakit -lps2_drivers -laudsrv -lpad -lmc -lpatches -lz -ljpeg -leedebug -ldebug -lm
@@ -1795,15 +1795,11 @@ PS2_PORT_LDFLAGS := -Wl,-zmax-page-size=128 -T$(PS2SDK)/ee/startup/linkfile -Wl,
 	-Wl,--wrap=gsKit_TexManager_init -Wl,--wrap=gsKit_clear -Wl,--wrap=gsKit_queue_exec \
 	-Wl,--wrap=gsKit_sync_flip -Wl,--wrap=gsKit_finish -Wl,--wrap=gsKit_queue_reset $(PS2_PORT_LIBS)
 
-ps2-port: $(PS2_PORT_ELF) $(PS2_PORT_PACKED_ASSETS)
-	@echo "PS2 port is up to date: $(PS2_PORT_ELF) and $(PS2_PORT_PACKED_ASSETS)"
+ps2-port: $(PS2_PORT_ELF)
+	@echo "PS2 port is up to date: $(PS2_PORT_ELF)"
 
 ps2-port-elf: $(PS2_PORT_ELF)
 	@echo "PS2 ELF is up to date: $(PS2_PORT_ELF)"
-
-$(PS2_PORT_PACKED_ASSETS): $(PS2_PORT_BASEROM) $(PS2_PORT_ASSET_SEGMENT_TABLE_SOURCE) $(PS2_PORT_ASSET_TRANSFORM) $(PS2_PORT_PACK_ASSETS_TOOL)
-	$(PYTHON) $(PS2_PORT_PACK_ASSETS_TOOL) --rom $(PS2_PORT_BASEROM) \
-		--asset-table $(PS2_PORT_ASSET_SEGMENT_TABLE_SOURCE) --transform $(PS2_PORT_ASSET_TRANSFORM) --output $@
 
 PS2_PORT_GFX_HOT_CFLAGS := $(filter-out -O2,$(PS2_PORT_CFLAGS)) -O3
 
@@ -1820,7 +1816,14 @@ $(PS2_PORT_BUILD_DIR)/%.o: %.s
 
 $(PS2_PORT_SETUP_STAMP): $(PS2_PORT_ASSET_SNAPSHOT) $(PS2_PORT_SNAPSHOT_TOOL) Makefile
 	@mkdir -p $(dir $@)
-	$(PYTHON) $(PS2_PORT_SNAPSHOT_TOOL) restore $(PS2_PORT_ASSET_SNAPSHOT) $(PS2_PORT_BUILD_DIR) --shared-names
+	@mkdir -p $(PS2_PORT_INCLUDE_DIR)
+	cp -R include/. $(PS2_PORT_INCLUDE_DIR)
+	$(PS2_PORT_PYTHON) $(PS2_PORT_SNAPSHOT_TOOL) restore $(PS2_PORT_ASSET_SNAPSHOT) $(PS2_PORT_BUILD_DIR)
+	mv -f $(PS2_PORT_BUILD_DIR)/oot_psp_rominfo.c $(PS2_PORT_ROMINFO_SOURCE)
+	mv -f $(PS2_PORT_BUILD_DIR)/oot_psp_asset_tables.c $(PS2_PORT_ASSET_TABLE_SOURCE)
+	mv -f $(PS2_PORT_BUILD_DIR)/oot_psp_audio_tables.c $(PS2_PORT_AUDIO_TABLE_SOURCE)
+	mv -f $(PS2_PORT_BUILD_DIR)/oot_psp_asset_segments.S $(PS2_PORT_ASSET_SEGMENT_SOURCE)
+	mv -f $(PS2_PORT_BUILD_DIR)/oot_psp_asset_segments.c $(PS2_PORT_ASSET_SEGMENT_TABLE_SOURCE)
 	@touch $@
 
 $(PS2_PORT_ROMINFO_SOURCE) $(PS2_PORT_ASSET_TABLE_SOURCE) $(PS2_PORT_AUDIO_TABLE_SOURCE) \
@@ -1863,7 +1866,7 @@ $(PS2_PORT_BASE_ELF): $(PS2_PORT_ENTRY_OBJECT) $(PS2_PORT_LIBRARY)
 	$(PS2_PORT_CC) -o $@ $(PS2_PORT_ENTRY_OBJECT) -Wl,--start-group $(PS2_PORT_LIBRARY) -Wl,--end-group $(PS2_PORT_LDFLAGS)
 
 $(PS2_PORT_RUNTIME_PATCH_BLOB): $(PS2_PORT_BASE_ELF) $(PS2_PORT_RUNTIME_PATCH_MANIFEST) $(PS2_PORT_RUNTIME_PATCH_TOOL)
-	$(PYTHON) $(PS2_PORT_RUNTIME_PATCH_TOOL) resolve $< $(PS2_PORT_RUNTIME_PATCH_MANIFEST) $@ --base-elf $(PS2_PORT_BASE_ELF)
+	$(PS2_PORT_PYTHON_ENV) $(PS2_PORT_PYTHON) $(PS2_PORT_RUNTIME_PATCH_TOOL) resolve $< $(PS2_PORT_RUNTIME_PATCH_MANIFEST) $@ --base-elf $(PS2_PORT_BASE_ELF)
 
 $(PS2_PORT_RUNTIME_PATCH_ASM): $(PS2_PORT_RUNTIME_PATCH_BLOB)
 	@printf '%s\n' \
@@ -1881,7 +1884,7 @@ $(PS2_PORT_RUNTIME_PATCH_OBJECT): $(PS2_PORT_RUNTIME_PATCH_ASM)
 $(PS2_PORT_ELF): $(PS2_PORT_ENTRY_OBJECT) $(PS2_PORT_LIBRARY) $(PS2_PORT_RUNTIME_PATCH_OBJECT)
 	@mkdir -p $(dir $@)
 	$(PS2_PORT_CC) -o $@ $(PS2_PORT_ENTRY_OBJECT) -Wl,--start-group $(PS2_PORT_LIBRARY) -Wl,--end-group $(PS2_PORT_RUNTIME_PATCH_OBJECT) $(PS2_PORT_LDFLAGS)
-	$(PYTHON) $(PS2_PORT_RUNTIME_PATCH_TOOL) resolve $@ $(PS2_PORT_RUNTIME_PATCH_MANIFEST) $(PS2_PORT_RUNTIME_PATCH_BLOB) --base-elf $(PS2_PORT_BASE_ELF)
+	$(PS2_PORT_PYTHON_ENV) $(PS2_PORT_PYTHON) $(PS2_PORT_RUNTIME_PATCH_TOOL) resolve $@ $(PS2_PORT_RUNTIME_PATCH_MANIFEST) $(PS2_PORT_RUNTIME_PATCH_BLOB) --base-elf $(PS2_PORT_BASE_ELF)
 	$(PS2_PORT_CC) -MMD -MP -MF $(PS2_PORT_RUNTIME_PATCH_OBJECT:.o=.d) -MT $(PS2_PORT_RUNTIME_PATCH_OBJECT) -c -x assembler-with-cpp $(PS2_PORT_ASM_DEFINES) $(PS2_PORT_INCLUDES) -o $(PS2_PORT_RUNTIME_PATCH_OBJECT) $(PS2_PORT_RUNTIME_PATCH_ASM)
 	$(PS2_PORT_CC) -o $@ $(PS2_PORT_ENTRY_OBJECT) -Wl,--start-group $(PS2_PORT_LIBRARY) -Wl,--end-group $(PS2_PORT_RUNTIME_PATCH_OBJECT) $(PS2_PORT_LDFLAGS)
 

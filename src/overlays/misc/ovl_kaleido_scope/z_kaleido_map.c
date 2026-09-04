@@ -11,7 +11,7 @@
 #include "versions.h"
 #include "play_state.h"
 #include "save.h"
-#if PLATFORM_PSP
+#if PLATFORM_PSP || defined(TARGET_PS2)
 #include "segmented_address.h"
 #endif
 
@@ -28,7 +28,7 @@
 #include "assets/textures/icon_item_dungeon_static/icon_item_dungeon_static.h"
 #include "assets/textures/icon_item_nes_static/icon_item_nes_static.h"
 
-#if PLATFORM_PSP
+#if PLATFORM_PSP || defined(TARGET_PS2)
 #define KALEIDO_MAP_TEXTURE(ptr) SEGMENTED_TO_VIRTUAL(ptr)
 #else
 #define KALEIDO_MAP_TEXTURE(ptr) (ptr)

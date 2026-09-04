@@ -34,7 +34,7 @@
 #include "oot_psp_compat.h"
 #endif
 
-#if PLATFORM_PSP
+#if PLATFORM_PSP || defined(TARGET_PS2)
 #define nintendo_rogo_static_Tex_000000_WIDTH 192
 #define nintendo_rogo_static_Tex_000000_HEIGHT 32
 extern u64 nintendo_rogo_static_Tex_000000[];
@@ -304,6 +304,8 @@ void ConsoleLogo_Main(GameState* thisx) {
     gSPSegment(POLY_OPA_DISP++, 0, NULL);
 #if PLATFORM_PSP
     gSegments[1] = OS_K0_TO_PHYSICAL(this->staticSegment);
+#elif defined(TARGET_PS2)
+    gSegments[1] = (uintptr_t)this->staticSegment;
 #endif
     gSPSegment(POLY_OPA_DISP++, 1, this->staticSegment);
     Gfx_SetupFrame(this->state.gfxCtx, 0, 0, 0);

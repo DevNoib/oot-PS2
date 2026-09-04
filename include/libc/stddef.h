@@ -1,4 +1,4 @@
-#if defined(TARGET_PSP) || defined(PLATFORM_PSP)
+#if defined(TARGET_PSP) || defined(PLATFORM_PSP) || defined(TARGET_PS2)
 #if !defined(STDDEF_H) || defined(__need_wint_t) || defined(__need_size_t) || defined(__need_ptrdiff_t) || \
     defined(__need_NULL)
 #if !defined(__need_wint_t) && !defined(__need_size_t) && !defined(__need_ptrdiff_t) && !defined(__need_NULL)

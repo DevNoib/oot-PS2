@@ -1,7 +1,7 @@
 #ifndef STRING_H
 #define STRING_H
 
-#if defined(TARGET_PSP) || defined(PLATFORM_PSP)
+#if defined(TARGET_PSP) || defined(PLATFORM_PSP) || defined(TARGET_PS2)
 #include_next <string.h>
 #else
 

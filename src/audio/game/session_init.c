@@ -4,12 +4,12 @@
 #include "audio.h"
 
 #include "assets/audio/sequence_sizes.h"
-#if !defined(TARGET_PSP)
+#if !defined(TARGET_PSP) && !defined(TARGET_PS2)
 #include "assets/audio/soundfont_sizes.h"
 #endif
 
 #define SFX_SEQ_SIZE Sequence_0_SIZE
-#if defined(TARGET_PSP)
+#if defined(TARGET_PSP) || defined(TARGET_PS2)
 #define NUM_SOUNDFONTS 38
 #define SFX_SOUNDFONTS_SIZE 0xC000
 #else

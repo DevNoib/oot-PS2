@@ -17,7 +17,7 @@
 #include "save.h"
 #include "line_numbers.h"
 
-#if !PLATFORM_PSP
+#if !PLATFORM_PSP && !defined(TARGET_PS2)
 
 #include "assets/scenes/indoors/miharigoya/miharigoya_scene.h"
 #include "assets/scenes/indoors/souko/souko_scene.h"
@@ -99,7 +99,7 @@ void Scene_DrawConfigFishingPond(PlayState* play);
 void Scene_DrawConfigGanonsTowerCollapseInterior(PlayState* play);
 void Scene_DrawConfigInsideGanonsCastleCollapse(PlayState* play);
 
-#if !PLATFORM_PSP
+#if !PLATFORM_PSP && !defined(TARGET_PS2)
 
 // Entrance Table definition
 #define DEFINE_ENTRANCE(_0, sceneId, spawn, continueBgm, displayTitleCard, endTransType, startTransType) \
@@ -148,7 +148,7 @@ SceneTableEntry gSceneTable[] = {
 
 #endif
 
-#if PLATFORM_PSP
+#if PLATFORM_PSP || defined(TARGET_PS2)
 #define OOT_PSP_SCENE_ASSET(name, offset) OOT_PSP_SCENE_ADDR(offset)
 #define OOT_PSP_ROOM_ASSET(name, offset) ((Gfx*)OOT_PSP_ROOM_ADDR(offset))
 #else

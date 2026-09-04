@@ -1,7 +1,7 @@
 #ifndef STDINT_H
 #define STDINT_H
 
-#if defined(TARGET_PSP) || defined(PLATFORM_PSP)
+#if defined(TARGET_PSP) || defined(PLATFORM_PSP) || defined(TARGET_PS2)
 #include_next <stdint.h>
 #else
 typedef signed long intptr_t;
