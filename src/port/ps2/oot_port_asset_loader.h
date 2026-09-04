@@ -52,6 +52,7 @@ extern const OotPortMessageEntry gOotPortStaffMessageEntries[];
 extern const size_t gOotPortStaffMessageEntriesCount;
 
 s32 OotPort_AssetInit(const char* executablePath);
+
 void OotPort_AssetNotifyResume(void);
 const char* OotPort_ResolveRootPath(const char* path, char* buffer, size_t bufferSize);
 const char* OotPort_GetAssetRoot(void);
