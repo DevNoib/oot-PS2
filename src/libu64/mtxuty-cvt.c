@@ -3,7 +3,7 @@
 #include "libu64/mtxuty-cvt.h"
 
 void MtxConv_F2L(Mtx* m1, MtxF* m2) {
-#if !PLATFORM_PSP
+#if !PLATFORM_PSP && !defined(TARGET_PS2)
     s32 i;
     s32 j;
 #endif
@@ -11,7 +11,7 @@ void MtxConv_F2L(Mtx* m1, MtxF* m2) {
     LOG_UTILS_CHECK_NULL_POINTER("m1", m1, "../mtxuty-cvt.c", 31);
     LOG_UTILS_CHECK_NULL_POINTER("m2", m2, "../mtxuty-cvt.c", 32);
 
-#if PLATFORM_PSP
+#if PLATFORM_PSP || defined(TARGET_PS2)
     guMtxF2L(m2->mf, m1);
 #else
     for (i = 0; i < 4; i++) {
